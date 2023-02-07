@@ -57,3 +57,9 @@
 | `daAmount`           | Сумма поддержки в валюте зрителя                                                                       |
 | `daCurrency`         | Выбранная для поддержки валюта                                                                         |
 | `daAmountConverteed` | Сумма поддержки в валюте аккаунта стримера                                                             |
+
+## Автор
+
+**play_code** <info@play-code.info>
+
+https://twitch.tv/play_code

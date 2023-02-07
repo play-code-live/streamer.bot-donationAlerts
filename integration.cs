@@ -10,6 +10,12 @@ using System.Net.WebSockets;
 using System.Threading;
 using System.Timers;
 
+///----------------------------------------------------------------------------
+///   Module:     DonationAlertsIntegration
+///   Author:     play_code (https://twitch.tv/play_code)
+///   Email:      info@play-code.live
+///   Repository: https://github.com/play-code-live/streamer.bot-donationAlerts
+///----------------------------------------------------------------------------
 public class CPHInline
 {
     private HttpListener listener = null;
@@ -39,16 +45,6 @@ public class CPHInline
     public bool Execute()
     {
         return true;
-    }
-
-    public void Dispose()
-    {
-        // place your dispose code here
-    }
-
-    public void Init()
-    {
-        // place your init code here
     }
     #endregion
 
@@ -210,7 +206,6 @@ public class CPHInline
 
             return true;
         }
-        //------------------------------------------------------------▼ Exception
         catch (WebException e)
         {
             var response = (HttpWebResponse)e.Response;
@@ -264,7 +259,6 @@ public class CPHInline
             throw new Exception("Access token not found");
         if (userId == 0)
             throw new Exception("There is no presaved user Id. Try reconnecting the DA integration");
-        //TODO Check for refreshing
         var payload = "{\"client\":\"" + socketClientId + "\", \"channels\": [\"" + string.Format("[$alerts:donation_{0}]", userId) + "\"]}";
 
         var headers = new Dictionary<string, string>
