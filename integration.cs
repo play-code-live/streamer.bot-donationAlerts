@@ -18,7 +18,11 @@ using System.Timers;
 ///----------------------------------------------------------------------------
 public class CPHInline
 {
+    private const double Version = 0.3;
+    private const string RepoReleasesAPIEndpoint = "https://api.github.com/repos/play-code-live/streamer.bot-donationAlerts/releases?per_page=100";
+
     private HttpListener listener = null;
+    private ClientWebSocket socket = null;
 
     private readonly string targetHost = "https://www.donationalerts.com";
     private readonly string socketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
@@ -33,6 +37,9 @@ public class CPHInline
 
     private readonly string handlerActionName = "DonationHandler_Default";
 
+    private const string argsKeyClientId = "daClientId";
+    private const string argsKeyClientSecret = "daClientSecret";
+
 
     #region Texts
     private readonly string textPleaseConnect = "Please connect to DonationAlerts using the Webpage that opened to obtain your token. " +
@@ -42,16 +49,31 @@ public class CPHInline
     #endregion
 
     #region Default Methods
-    public bool Execute()
+    public void Init()
     {
-        return true;
+        var newerVersion = GetNewerGitHubVersion(Version);
+        if (newerVersion != null)
+            CPH.SendMessage(string.Format("Доступно обновление интеграции с DonationAlerts. Версия {0} - {1}", newerVersion.tag_name, newerVersion.html_url));
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (this.socket == null)
+                return;
+            this.socket.Abort();
+            this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+            this.socket = null;
+        }
+        catch (Exception) { }
     }
     #endregion
 
     public bool CreateAuthLink()
     {
-        string clientId = args["daClientId"].ToString();
-        string clientSecret = args["daClientSecret"].ToString();
+        string clientId = args[argsKeyClientId].ToString();
+        string clientSecret = args[argsKeyClientSecret].ToString();
 
         if (clientId == "" || clientSecret == "")
         {
@@ -59,8 +81,8 @@ public class CPHInline
             return false;
         }
 
-        CPH.SetGlobalVar("daClientId", clientId, true);
-        CPH.SetGlobalVar("daClientSecret", clientSecret, true);
+        CPH.SetGlobalVar(argsKeyClientId, clientId, true);
+        CPH.SetGlobalVar(argsKeyClientSecret, clientSecret, true);
 
         string url = this.targetHost + this.endpointAuthorize;
         string urlRequest = string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, clientId, this.GetEncodedRedirectUri(), this.defaultScope);
@@ -101,8 +123,8 @@ public class CPHInline
 
     public bool ObtainAccessToken()
     {
-        string clientId = CPH.GetGlobalVar<string>("daClientId");
-        string clientSecret = CPH.GetGlobalVar<string>("daClientSecret");
+        string clientId = CPH.GetGlobalVar<string>(argsKeyClientId);
+        string clientSecret = CPH.GetGlobalVar<string>(argsKeyClientSecret);
         string code = CPH.GetGlobalVar<string>("daCode");
         if (clientId == "" || clientSecret == "" || code == "")
         {
@@ -162,8 +184,8 @@ public class CPHInline
         if (args.ContainsKey("refresh_token_recursion_protection"))
             return false;
         this.Debug("Refreshing access token");
-        string clientId = CPH.GetGlobalVar<string>("daClientId");
-        string clientSecret = CPH.GetGlobalVar<string>("daClientSecret");
+        string clientId = CPH.GetGlobalVar<string>(argsKeyClientId);
+        string clientSecret = CPH.GetGlobalVar<string>(argsKeyClientSecret);
         string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
         if (clientId == "" || clientSecret == "" || refreshToken == "")
         {
@@ -238,7 +260,6 @@ public class CPHInline
 
             return true;
         }
-        //------------------------------------------------------------▼ Exception
         catch (WebException e)
         {
             var response = (HttpWebResponse)e.Response;
@@ -259,6 +280,7 @@ public class CPHInline
             throw new Exception("Access token not found");
         if (userId == 0)
             throw new Exception("There is no presaved user Id. Try reconnecting the DA integration");
+
         var payload = "{\"client\":\"" + socketClientId + "\", \"channels\": [\"" + string.Format("[$alerts:donation_{0}]", userId) + "\"]}";
 
         var headers = new Dictionary<string, string>
@@ -285,33 +307,33 @@ public class CPHInline
         return true;
     }
 
-    private void ConnectToSocket(bool isReconnected = false)
+    private Task ConnectToSocket(bool isReconnected = false)
     {
-        var ws = new ClientWebSocket();
+        this.socket = new ClientWebSocket();
         this.Debug("Ready to connect to the socket");
-        ws.ConnectAsync(new Uri(this.socketHost), CancellationToken.None).GetAwaiter().GetResult();
+        this.socket.ConnectAsync(new Uri(this.socketHost), CancellationToken.None).GetAwaiter().GetResult();
         this.Debug("Connected to the socket");
+        CPH.SendMessage("DonationAlert Background Watcher is ON");
 
         var buf = new ArraySegment<byte>(new byte[1024]);
 
-        if (ws.State == WebSocketState.Open)
+        if (this.socket.State == WebSocketState.Open)
         {
-            string socketClientId = this.ObtainSocketClientId(ws);
+            string socketClientId = this.ObtainSocketClientId(this.socket);
             var channelInfo = this.ObtainPrivateChannelConnectionToken(socketClientId);
-            this.SubscribeToTheChannel(channelInfo.channel, channelInfo.token, ws);
+            this.SubscribeToTheChannel(channelInfo.channel, channelInfo.token);
         }
 
-        CPH.SendMessage("DonationAlert Background Watcher is ON");
         try
         {
-            while (ws.State == WebSocketState.Open)
+            while (this.socket.State == WebSocketState.Open)
             {
                 this.Debug("Waiting for a message");
-                var result = ws.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+                var result = this.socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
                 this.Debug("Message recieved");
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+                    this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                     this.Debug(result.CloseStatusDescription);
                 }
                 else
@@ -324,6 +346,8 @@ public class CPHInline
                     {
                         var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationEvent>>(rawMessage);
                         var donation = donationEvent["result"].data.data;
+                        if (!this.IsValidDonation(donation))
+                            continue;
                         this.ExportDonation(donation);
 
                         string targetActionName = string.Format("DonationHandler_{0}", donation.amount);
@@ -339,21 +363,23 @@ public class CPHInline
                     catch (Exception e) { }
                 }
             }
-        } catch (Exception e)
+        }
+        catch (Exception e)
         {
             if (isReconnected)
             {
                 this.Debug("Cannot reconnect to socket too many times");
-                return;
+                return null;
             }
-            this.ConnectToSocket(true);
         }
+
+        return this.ConnectToSocket(true);
     }
 
-    private void SubscribeToTheChannel(string channel, string channelToken, ClientWebSocket ws)
+    private void SubscribeToTheChannel(string channel, string channelToken)
     {
         var request = "{\"id\":2,\"method\":1,\"params\":{\"channel\":\"" + channel + "\", \"token\":\"" + channelToken + "\"}}";
-        ws.SendAsync(
+        this.socket.SendAsync(
             new ArraySegment<byte>(Encoding.ASCII.GetBytes(request)),
             WebSocketMessageType.Text,
             true,
@@ -365,11 +391,11 @@ public class CPHInline
 
         for (int i = 0; i < 2; i++)
         {
-            var result = ws.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+            var result = this.socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
             this.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+                this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                 this.Debug(result.CloseStatusDescription);
                 throw new Exception("Socket has closed connection");
             }
@@ -417,6 +443,11 @@ public class CPHInline
         var authResponse = JsonConvert.DeserializeObject<SocketAuthResponse>(Encoding.ASCII.GetString(buf.Array, 0, result.Count));
 
         return authResponse.result.client;
+    }
+
+    private bool IsValidDonation(DonationData donation)
+    {
+        return donation.amount > 0;
     }
 
     private void ExportDonation(DonationData donation)
@@ -633,5 +664,64 @@ public class CPHInline
         public double amount;
         public string currency;
         public double amount_in_user_currency;
+    }
+
+    public GitHubReleaseResponse GetNewerGitHubVersion(double currentVersion)
+    {
+        var newer = this.FetchLatestGitHubVersion();
+        if (newer == null)
+            return null;
+
+        var numbericVersion = Convert.ToDouble(newer.tag_name.Substring(1).Replace('.', ','));
+        if (currentVersion >= numbericVersion)
+            return null;
+
+        return newer;
+    }
+
+    public GitHubReleaseResponse FetchLatestGitHubVersion()
+    {
+        try
+        {
+            var releases = this.GetGitHubReleaseVersionsAsync();
+            foreach (var release in releases)
+            {
+                if (release.draft || release.prerelease)
+                    continue;
+
+                return release;
+            }
+        } catch (Exception e)
+        {
+            this.Debug("Cannot fetch versions of integration. Error: " + e.Message);
+            throw e;
+        }
+
+        return null;
+    }
+
+    private List<GitHubReleaseResponse> GetGitHubReleaseVersionsAsync()
+    {
+        try
+        {
+            WebClient webClient = new WebClient();
+            webClient.Headers.Add("User-Agent", "StreamerBot DA Integration");
+            Uri uri = new Uri(RepoReleasesAPIEndpoint);
+            string releases = webClient.DownloadString(uri);
+
+            return JsonConvert.DeserializeObject<List<GitHubReleaseResponse>>(releases);
+        } catch (Exception)
+        {
+        }
+        return new List<GitHubReleaseResponse>();
+    }
+
+    public class GitHubReleaseResponse
+    {
+        public string html_url { get; set; }
+        public string tag_name { get; set; }
+        public string name { get; set; }
+        public bool prerelease { get; set; }
+        public bool draft { get; set; }
     }
 }
