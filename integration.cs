@@ -18,8 +18,9 @@ using System.Timers;
 ///----------------------------------------------------------------------------
 public class CPHInline
 {
-    private const double Version = 0.3;
+    private const double Version = 0.4;
     private const string RepoReleasesAPIEndpoint = "https://api.github.com/repos/play-code-live/streamer.bot-donationAlerts/releases?per_page=100";
+
 
     private HttpListener listener = null;
     private ClientWebSocket socket = null;
@@ -288,7 +289,19 @@ public class CPHInline
             { "Authorization", "Bearer " + accessToken }
         };
 
-        var response = this.PerformPOST(this.endpointSubscribe, payload, headers);
+        string response = "";
+        try
+        {
+            response = this.PerformPOST(this.endpointSubscribe, payload, headers);
+        } catch (WebException e)
+        {
+            if (e.Response is HttpWebResponse errorResponse && errorResponse.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                CPH.SendMessage("Необходимо выполнить авторизацию в DonationAlerts для работы интеграции. Введите команду !da_connect");
+                throw e;
+            }
+        }
+        
         var channels = JsonConvert.DeserializeObject<Dictionary<string, List<ChannelSubscribeResponseItem>>>(response);
 
         if (channels["channels"].Count == 0)
@@ -313,9 +326,10 @@ public class CPHInline
         this.Debug("Ready to connect to the socket");
         this.socket.ConnectAsync(new Uri(this.socketHost), CancellationToken.None).GetAwaiter().GetResult();
         this.Debug("Connected to the socket");
-        CPH.SendMessage("DonationAlert Background Watcher is ON");
+        if (isReconnected == false)
+            CPH.SendMessage("DonationAlert Background Watcher is ON");
 
-        var buf = new ArraySegment<byte>(new byte[1024]);
+        var buf = new ArraySegment<byte>(new byte[2048]);
 
         if (this.socket.State == WebSocketState.Open)
         {
@@ -672,8 +686,8 @@ public class CPHInline
         if (newer == null)
             return null;
 
-        var numbericVersion = Convert.ToDouble(newer.tag_name.Substring(1).Replace('.', ','));
-        if (currentVersion >= numbericVersion)
+        var numericVersion = Convert.ToDouble(newer.tag_name.Substring(1).Replace('.', ','));
+        if (currentVersion >= numericVersion)
             return null;
 
         return newer;
