@@ -535,9 +535,8 @@ public class Service
                     string code = queryDictionary["code"];
                     Handler(code);
 
-                    //TODO: Replace html page
-                    string pageData = "<!DOCTYPE><html><head><title>DONATION ALERTS TO STREAMER.BOT</title></head><body>Success! You can close this window</body></html>";
-                    byte[] data = Encoding.UTF8.GetBytes(string.Format(pageData));
+                    string pageData = "<!DOCTYPE html><html><head><title>Интеграция DonationAlerts + Streamer.bot</title><meta charset=\"UTF-8\"><link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha2/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-aFq/bzH65dt+w6FI2ooMVUpc+21e0SRygnTpmBvdBgSdnuTN7QbdgL+OapgHtvPp\" crossorigin=\"anonymous\"><style>body{background-color:#111}</style></head><body><div class=\"container text-center mt-5 text-white-50\"><h3>Успешно авторизован</h3><p>Вы можете закрыть эту вкладку</p><iframe src=\"https://player.twitch.tv/?channel=play_code&parent=127.0.0.1\" frameborder=\"0\" allowfullscreen=\"true\" scrolling=\"no\" height=\"378\" width=\"620\"></iframe><hr><p class=\"font-monospace\">Спасибо за использование интеграции!<br>Если вы столкнулись с любыми сложностями или хотите предложить улучшение функционала,<br>воспользуйтесь секцией <strong>Issues</strong> на <a href=\"https://github.com/play-code-live/streamer.bot-donationAlerts/issues/new\">GitHub</a><br>❤️</p></div></body></html>";
+                    byte[] data = Encoding.UTF8.GetBytes(pageData);
                     resp.ContentType = "text/html";
                     resp.ContentEncoding = Encoding.UTF8;
                     resp.ContentLength64 = data.LongLength;
