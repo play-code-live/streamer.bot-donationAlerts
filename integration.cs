@@ -18,468 +18,726 @@ using System.Timers;
 ///----------------------------------------------------------------------------
 public class CPHInline
 {
-    private const double Version = 0.4;
-    private const string RepoReleasesAPIEndpoint = "https://api.github.com/repos/play-code-live/streamer.bot-donationAlerts/releases?per_page=100";
+    public class PrefixedLogger
+    {
+        private IInlineInvokeProxy _CPH { get; set; }
+        private const string Prefix = "-- Donation Alerts:";
 
+        public PrefixedLogger(IInlineInvokeProxy _CPH)
+        {
+            this._CPH = _CPH;
+        }
 
-    private HttpListener listener = null;
-    private ClientWebSocket socket = null;
+        public void Debug(string message)
+        {
+            message = string.Format("{0} {1}", Prefix, message);
+            _CPH.LogDebug(message);
+        }
+        public void Debug(string message, params Object[] additional)
+        {
+            string finalMessage = message;
+            foreach (var line in additional)
+            {
+                finalMessage += ", " + line;
+            }
+            this.Debug(finalMessage);
+        }
+    }
+    private Service Service { get; set; }
+    private SocketService SocketService { get; set; }
+    private PrefixedLogger Logger { get; set; }
 
-    private readonly string targetHost = "https://www.donationalerts.com";
-    private readonly string socketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
-
-    private readonly string endpointAuthorize = "/oauth/authorize";
-    private readonly string endpointToken = "/oauth/token";
-    private readonly string endpointProfileInfo = "/api/v1/user/oauth";
-    private readonly string endpointSubscribe = "/api/v1/centrifuge/subscribe";
-
-    private readonly string defaultScope = "oauth-donation-index oauth-user-show oauth-donation-subscribe";
-    private readonly string redirectUrl = "http://127.0.0.1:8554/donationAlertsRedirectUri/";
-
-    private readonly string handlerActionName = "DonationHandler_Default";
-
-    private const string argsKeyClientId = "daClientId";
-    private const string argsKeyClientSecret = "daClientSecret";
-
-
-    #region Texts
-    private readonly string textPleaseConnect = "Please connect to DonationAlerts using the Webpage that opened to obtain your token. " +
+    private const string DefaultHandlerActionName = "DonationHandler_Default";
+    private const string TextPleaseConnect = "Please connect to DonationAlerts using the Webpage that opened to obtain your token. " +
             "Для продолжения подтвердите авторизацию в появившемся окне браузера";
-    private readonly string textAuthLinkRequirements = "To connect integration you need to specify daClientId and daClientSecret arguments. " +
-            "Чтобы начать подключение, вам необходимо указать daClientId и daClientSecret аргументы";
-    #endregion
 
-    #region Default Methods
     public void Init()
     {
-        var newerVersion = GetNewerGitHubVersion(Version);
-        if (newerVersion != null)
-            CPH.SendMessage(string.Format("Доступно обновление интеграции с DonationAlerts. Версия {0} - {1}", newerVersion.tag_name, newerVersion.html_url));
-    }
+        CPH.ExecuteMethod("DonationAlert Update Checker", "CheckAndAnnounce");
+        Logger   = new PrefixedLogger(CPH);
+        Service  = new Service(new Client(), Logger);
 
+        SocketService = new SocketService(Service, Logger);
+    }
     public void Dispose()
     {
-        try
-        {
-            if (this.socket == null)
-                return;
-            this.socket.Abort();
-            this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-            this.socket = null;
-        }
-        catch (Exception) { }
+        SocketService.Close();
     }
-    #endregion
-
     public bool CreateAuthLink()
     {
-        string clientId = args[argsKeyClientId].ToString();
-        string clientSecret = args[argsKeyClientSecret].ToString();
+        string authLink = Service.GetAuthLink();
+        CPH.SendMessage(TextPleaseConnect);
+        System.Diagnostics.Process.Start(authLink);
+        Logger.Debug("Opened URL in the default browser. Awaiting for confirmation");
 
-        if (clientId == "" || clientSecret == "")
+        return Service.ServeAndListenAuth(delegate (string code)
         {
-            CPH.SendMessage(this.textAuthLinkRequirements);
+            CPH.SetGlobalVar("daCode", code, true);
+            Logger.Debug("code : " + code);
+            return code;
+        });
+    }
+    public bool ObtainAccessToken()
+    {
+        string code = CPH.GetGlobalVar<string>("daCode");
+        if (code == "")
+        {
+            Logger.Debug("Code argument has not arrivied. Make sure you initialized connection for the DA");
             return false;
         }
 
-        CPH.SetGlobalVar(argsKeyClientId, clientId, true);
-        CPH.SetGlobalVar(argsKeyClientSecret, clientSecret, true);
-
-        string url = this.targetHost + this.endpointAuthorize;
-        string urlRequest = string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, clientId, this.GetEncodedRedirectUri(), this.defaultScope);
-        CPH.SendMessage(this.textPleaseConnect);
-        System.Diagnostics.Process.Start(urlRequest);
-        CPH.LogDebug("Opened URL in the default browser. Awaiting for confirmation");
-        try
-        {
-            listener = new HttpListener();
-            listener.Prefixes.Add(this.redirectUrl);
-            listener.Start();
-            Task listenTask = HandleIncomingConnections();
-            var forceCloseTimer = new System.Timers.Timer(30000);
-            forceCloseTimer.Elapsed += this.WebServerForceClose;
-            forceCloseTimer.AutoReset = true;
-            forceCloseTimer.Enabled = true;
-            listenTask.GetAwaiter().GetResult();
-            listener.Close();
-        }
-        catch (WebException e)
-        {
-            this.Debug(e.Status.ToString());
+        var tokenData = Service.ObtainToken(code);
+        if (tokenData == null)
             return false;
-        }
+
+        CPH.SetGlobalVar("daAccessToken", tokenData.AccessToken, true);
+        CPH.SetGlobalVar("daRefreshToken", tokenData.RefreshToken, true);
+
+        Logger.Debug("AccessToken and RefreshToken are obtained successfully");
 
         return true;
     }
-
-    private void WebServerForceClose(Object source, ElapsedEventArgs e)
-    {
-        this.Debug("Timer invoked");
-        if (listener != null && listener.IsListening)
-        {
-            listener.Close();
-            this.Debug("Server has been closed by timeout");
-        }
-    }
-
-    public bool ObtainAccessToken()
-    {
-        string clientId = CPH.GetGlobalVar<string>(argsKeyClientId);
-        string clientSecret = CPH.GetGlobalVar<string>(argsKeyClientSecret);
-        string code = CPH.GetGlobalVar<string>("daCode");
-        if (clientId == "" || clientSecret == "" || code == "")
-        {
-            this.Debug("Some of the required arguments has not arrived. Make sure you initialized connection for the DA");
-            return false;
-        }
-
-
-        var values = new Dictionary<string, string>
-        {
-            { "grant_type", "authorization_code" },
-            { "client_id", clientId },
-            { "client_secret", clientSecret },
-            { "code", code },
-            { "redirect_uri", this.redirectUrl }
-        };
-
-        string accessToken = "";
-        string refreshToken = "";
-        try
-        {
-            string json = this.PerformPOST(this.endpointToken, values);
-            this.Debug("Request to the token API has been performed");
-            JsonTextReader reader = new JsonTextReader(new StringReader(json));
-            while (reader.Read())
-            {
-                string Path = reader.Path.Replace("[", "").Replace("]", "");
-                if ((reader.Value != null) && (reader.TokenType.ToString() != "PropertyName") && (Path == "access_token"))
-                {
-                    accessToken = reader.Value.ToString();
-                }
-
-                if ((reader.Value != null) && (reader.TokenType.ToString() != "PropertyName") && (Path == "refresh_token"))
-                {
-                    refreshToken = reader.Value.ToString();
-                }
-            }
-
-            CPH.SetGlobalVar("daAccessToken", accessToken, true);
-            CPH.SetGlobalVar("daRefreshToken", refreshToken, true);
-            this.Debug("Obtained accessToken and refreshToken successfully");
-
-            return true;
-        }
-        catch (WebException e)
-        {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            int statusCodeResponseAsInt = ((int)response.StatusCode);
-            this.Debug("Obtain token error", "status code", statusCodeResponseAsInt.ToString(), statusCodeResponse);
-            return false;
-        }
-    }
-
     public bool RefreshAccessToken()
     {
         if (args.ContainsKey("refresh_token_recursion_protection"))
             return false;
-        this.Debug("Refreshing access token");
-        string clientId = CPH.GetGlobalVar<string>(argsKeyClientId);
-        string clientSecret = CPH.GetGlobalVar<string>(argsKeyClientSecret);
-        string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
-        if (clientId == "" || clientSecret == "" || refreshToken == "")
-        {
-            this.Debug("Some of the required arguments has not arrived. Make sure you initialized connection for the DA");
-            return false;
-        }
-
-        var values = new Dictionary<string, string>
-        {
-            { "grant_type", "refresh_token" },
-            { "client_id", clientId },
-            { "client_secret", clientSecret },
-            { "refresh_token", refreshToken },
-            { "scope", this.defaultScope }
-        };
-
-        string accessToken = "";
-        try
-        {
-            string json = this.PerformPOST(this.endpointToken, values);
-            this.Debug("Request to the token API has been performed");
-            JsonTextReader reader = new JsonTextReader(new StringReader(json));
-            while (reader.Read())
-            {
-                string Path = reader.Path.Replace("[", "").Replace("]", "");
-                if ((reader.Value != null) && (reader.TokenType.ToString() != "PropertyName") && (Path == "access_token"))
-                {
-                    accessToken = reader.Value.ToString();
-                }
-
-                if ((reader.Value != null) && (reader.TokenType.ToString() != "PropertyName") && (Path == "refresh_token"))
-                {
-                    refreshToken = reader.Value.ToString();
-                }
-            }
-
-            CPH.SetGlobalVar("daAccessToken", accessToken, true);
-            CPH.SetGlobalVar("daRefreshToken", refreshToken, true);
-            CPH.SetArgument("refresh_token_recursion_protection", true);
-
-            return true;
-        }
-        catch (WebException e)
-        {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            int statusCodeResponseAsInt = ((int)response.StatusCode);
-            this.Debug("status code : " + statusCodeResponseAsInt.ToString() + " " + statusCodeResponse);
-            return false;
-        }
-    }
-
-    public bool GetProfileInfo()
-    {
-        this.Debug("Obtaining socket token");
-        string accessToken = CPH.GetGlobalVar<string>("daAccessToken");
-        if (accessToken == "")
-            return false;
-
-        var headers = new Dictionary<string, string>
-        {
-            { "Authorization", "Bearer " + accessToken }
-        };
-
-        try
-        {
-            string json = this.PerformGET(this.endpointProfileInfo, new Dictionary<string, string>(), headers);
-            ProfileInfoResponse profile = JsonConvert.DeserializeObject<ProfileInfoResponse>(json);
-            CPH.SetGlobalVar("daSocketToken", profile.data.socket_connection_token, true);
-            CPH.SetGlobalVar("daUserId", profile.data.id, true);
-            this.Debug("User ID", profile.data.id, json);
-
-            return true;
-        }
-        catch (WebException e)
-        {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            int statusCodeResponseAsInt = ((int)response.StatusCode);
-            this.Debug("status code : " + statusCodeResponseAsInt.ToString() + " " + statusCodeResponse);
-            if (!this.RefreshAccessToken())
-                return false;
-            return this.GetProfileInfo();
-        }
-    }
-
-    public ChannelSubscribeResponseItem ObtainPrivateChannelConnectionToken(string socketClientId)
-    {
-        string accessToken = CPH.GetGlobalVar<string>("daAccessToken");
-        int userId = CPH.GetGlobalVar<int>("daUserId");
-        if (accessToken == "")
-            throw new Exception("Access token not found");
-        if (userId == 0)
-            throw new Exception("There is no presaved user Id. Try reconnecting the DA integration");
-
-        var payload = "{\"client\":\"" + socketClientId + "\", \"channels\": [\"" + string.Format("[$alerts:donation_{0}]", userId) + "\"]}";
-
-        var headers = new Dictionary<string, string>
-        {
-            { "Authorization", "Bearer " + accessToken }
-        };
-
-        string response = "";
-        try
-        {
-            response = this.PerformPOST(this.endpointSubscribe, payload, headers);
-        } catch (WebException e)
-        {
-            if (e.Response is HttpWebResponse errorResponse && errorResponse.StatusCode == HttpStatusCode.Unauthorized)
-            {
-                CPH.SendMessage("Необходимо выполнить авторизацию в DonationAlerts для работы интеграции. Введите команду !da_connect");
-                throw e;
-            }
-        }
+        Logger.Debug("Refreshing access token");
         
-        var channels = JsonConvert.DeserializeObject<Dictionary<string, List<ChannelSubscribeResponseItem>>>(response);
+        string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
+        if (refreshToken == "")
+        {
+            Logger.Debug("RefreshToken argument has not arrived. Make sure you initialized connection for the DA");
+            return false;
+        }
 
-        if (channels["channels"].Count == 0)
-            throw new Exception("Cannot fetch channels and it's tokens");
+        var tokenData = Service.RefreshToken(refreshToken);
+        if (tokenData == null)
+            return false;
 
-        CPH.SetGlobalVar("daChannelToken", channels["channels"][0].token, false);
-        CPH.SetGlobalVar("daChannel", channels["channels"][0].channel, false);
+        CPH.SetGlobalVar("daAccessToken", tokenData.AccessToken, true);
+        CPH.SetGlobalVar("daRefreshToken", tokenData.RefreshToken, true);
+        CPH.SetArgument("refresh_token_recursion_protection", true);
 
-        this.Debug("Channel connection token recieved", channels["channels"][0].channel);
-        return channels["channels"][0];
-    }
-
-    public bool DonationCheckerLoop()
-    {
-        this.ConnectToSocket();
         return true;
     }
-
-    private Task ConnectToSocket(bool isReconnected = false)
+    public bool GetProfileInfo()
     {
-        this.socket = new ClientWebSocket();
-        this.Debug("Ready to connect to the socket");
-        this.socket.ConnectAsync(new Uri(this.socketHost), CancellationToken.None).GetAwaiter().GetResult();
-        this.Debug("Connected to the socket");
-        if (isReconnected == false)
-            CPH.SendMessage("DonationAlert Background Watcher is ON");
+        Logger.Debug("Obtaining socket token");
+        string accessToken = CPH.GetGlobalVar<string>("daAccessToken");
+        if (accessToken == "")
+            return false;
 
-        var buf = new ArraySegment<byte>(new byte[2048]);
+        var profileInfo = Service.GetProfileInfo(accessToken);
+        if (profileInfo == null)
+            return this.RefreshAccessToken() && this.GetProfileInfo();
 
-        if (this.socket.State == WebSocketState.Open)
+        CPH.SetGlobalVar("daSocketToken", profileInfo.SocketConnectionToken, true);
+        CPH.SetGlobalVar("daUserId", profileInfo.Id, true);
+
+        return true;
+    }
+    public bool DonationCheckerLoop()
+    {
+        string accessToken = CPH.GetGlobalVar<string>("daAccessToken");
+        if (string.IsNullOrEmpty(accessToken))
         {
-            string socketClientId = this.ObtainSocketClientId(this.socket);
-            var channelInfo = this.ObtainPrivateChannelConnectionToken(socketClientId);
-            this.SubscribeToTheChannel(channelInfo.channel, channelInfo.token);
+            CPH.SendMessage("Необходимо выполнить авторизацию в DonationAlerts. Введите команду !da_connect");
+            throw new Exception("Unauthorized");
+        }
+
+        SocketService
+            .On(SocketService.EventStarted, delegate (string Event, Dictionary<string, string> Data)
+            {
+                Logger.Debug("Ready to connect to the socket");
+            })
+            .On(SocketService.EventConnected, delegate (string Event, Dictionary<string, string> Data)
+            {
+                Logger.Debug("Connected to the socket");
+                CPH.SendMessage("DonationAlert Background Watcher is ON");
+            })
+            .On(SocketService.EventReconnected, delegate (string Event, Dictionary<string, string> Data)
+            {
+                Logger.Debug("Reconnected to the socket");
+            })
+            .On(SocketService.EventDisconnected, delegate (string Event, Dictionary<string, string> Data)
+            {
+                Logger.Debug("Disconnected from the socket", Data["description"]);
+            })
+            .On(SocketService.EventRecievedDonation, delegate (string Event, Dictionary<string, string> Data)
+            {
+                ExportDonation(Data);
+                string targetActionName = string.Format("DonationHandler_{0}", Data["amount"]);
+                if (CPH.ActionExists(targetActionName))
+                {
+                    CPH.RunAction(targetActionName, false);
+                }
+                else if (CPH.ActionExists(DefaultHandlerActionName))
+                {
+                    CPH.RunAction(DefaultHandlerActionName);
+                }
+            });
+
+        
+        SocketService.Start(accessToken);
+        return true;
+    }
+    private void ExportDonation(Dictionary<string, string> Donation)
+    {
+        string username = "Anonymous";
+        if (!string.IsNullOrEmpty(Donation["username"]))
+            username = Donation["username"];
+
+        CPH.SetArgument("daName", Donation["name"]);
+        CPH.SetArgument("daUsername", username);
+        CPH.SetArgument("daMessage", Donation["message"]);
+        CPH.SetArgument("daAmount", Donation["amount"]);
+        CPH.SetArgument("daCurrency", Donation["currency"]);
+        CPH.SetArgument("daAmountConverted", Donation["amount_in_user_currency"]);
+    }
+}
+
+public class SocketService
+{
+    private const string SocketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
+
+    public const string EventStarted      = "started";
+    public const string EventConnected    = "connected";
+    public const string EventDisconnected = "disconnected";
+    public const string EventReconnected  = "reconnected";
+    public const string EventAuthorized   = "authorized";
+    public const string EventSubscribed   = "subscribed";
+
+    public const string EventRecievedMessage  = "recieved_message";
+    public const string EventRecievedDonation = "recieved_donation";
+    private EventObserver Observer { get; set; }
+    private Service DaService { get; set; }
+    private ClientWebSocket Socket { get; set; }
+    private CPHInline.PrefixedLogger Logger { get; set; }
+
+    private const int BufferSize     = 2048;
+
+    public SocketService(Service service, CPHInline.PrefixedLogger Logger)
+    {
+        Observer    = new EventObserver();
+        DaService   = service;
+        this.Logger = Logger;
+    }
+    public SocketService On(string EventName, EventObserver.Handler handler)
+    {
+        Observer.Subscribe(EventName, handler);
+        return this;
+    }
+    public Task Start(string AccessToken)
+    {
+        return ConnectAndProccess(AccessToken);
+    }
+    public void Close()
+    {
+        try
+        {
+            if (Socket == null)
+                return;
+            Socket.Abort();
+            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+            Socket = null;
+            Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", "manual" } });
+        }
+        catch (Exception) { }
+        
+    }
+    private Task ConnectAndProccess(string AccessToken, bool isReconnected = false)
+    {
+        var userProfile = DaService.GetProfileInfo(AccessToken);
+
+        Socket = new ClientWebSocket();
+        Observer.Dispatch(EventStarted, null);
+        Socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
+        Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
+
+        var buf = new ArraySegment<byte>(new byte[BufferSize]);
+
+        if (Socket.State == WebSocketState.Open)
+        {
+            string socketClientId = ObtainSocketClientId(userProfile.SocketConnectionToken);
+            var channelInfo = DaService.ObtainChannelSubscribeToken(AccessToken, userProfile.Id, socketClientId);
+            this.SubscribeToTheChannel(channelInfo.Channel, channelInfo.Token);
         }
 
         try
         {
-            while (this.socket.State == WebSocketState.Open)
+            while (Socket.State == WebSocketState.Open)
             {
-                this.Debug("Waiting for a message");
-                var result = this.socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
-                this.Debug("Message recieved");
+                Logger.Debug("Waiting for a message");
+                var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-                    this.Debug(result.CloseStatusDescription);
+                    Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+                    Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
                 }
                 else
                 {
                     isReconnected = false;
-                    this.Debug("Recieved message");
+                    Logger.Debug("Recieved message");
                     string rawMessage = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-                    this.Debug(rawMessage);
+                    Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
+                    Logger.Debug(rawMessage);
                     try
                     {
-                        var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationEvent>>(rawMessage);
-                        var donation = donationEvent["result"].data.data;
-                        if (!this.IsValidDonation(donation))
+                        var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationResponse>>(rawMessage);
+                        var donation = donationEvent["result"].Data.Donation;
+                        if (donation.Amount <= 0)
                             continue;
-                        this.ExportDonation(donation);
 
-                        string targetActionName = string.Format("DonationHandler_{0}", donation.amount);
-                        if (CPH.ActionExists(targetActionName))
-                        {
-                            CPH.RunAction(targetActionName, false);
-                        }
-                        else if (CPH.ActionExists(this.handlerActionName))
-                        {
-                            CPH.RunAction(this.handlerActionName);
-                        }
+                        Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
                     }
-                    catch (Exception e) { }
+                    catch (Exception) { }
                 }
             }
         }
-        catch (Exception e)
+        catch (Exception)
         {
             if (isReconnected)
             {
-                this.Debug("Cannot reconnect to socket too many times");
+                Logger.Debug("Cannot reconnect to socket too many times");
                 return null;
             }
         }
 
-        return this.ConnectToSocket(true);
+        return ConnectAndProccess(AccessToken, true);
     }
 
-    private void SubscribeToTheChannel(string channel, string channelToken)
+    private string ObtainSocketClientId(string SocketToken)
     {
-        var request = "{\"id\":2,\"method\":1,\"params\":{\"channel\":\"" + channel + "\", \"token\":\"" + channelToken + "\"}}";
-        this.socket.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(request)),
+        if (Socket == null || Socket.State != WebSocketState.Open)
+            throw new Exception("Socket is closed");
+
+
+        var request = new SocketClientRequest
+        {
+            Parameters = new SocketClientRequestParams
+            {
+                Token = SocketToken,
+            }
+        };
+        var payload = JsonConvert.SerializeObject(request);
+
+        Socket.SendAsync(
+            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
             CancellationToken.None
         ).GetAwaiter().GetResult();
-        this.Debug("Subscribe request has been sent");
 
-        var buf = new ArraySegment<byte>(new byte[1024]);
+        var buffer = new ArraySegment<byte>(new byte[BufferSize]);
+        var result = Socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
+        Logger.Debug("Auth response resieved");
+        if (result.MessageType == WebSocketMessageType.Close)
+        {
+            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+            Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
+            throw new Exception("Socket has closed connection");
+        }
+        Logger.Debug("Recieved auth message");
+
+        var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(Encoding.ASCII.GetString(buffer.Array, 0, result.Count));
+
+        Observer.Dispatch(EventAuthorized, new Dictionary<string, string> { { "client", authResponse.Data.Client }, { "version", authResponse.Data.Version } });
+
+        return authResponse.Data.Client;
+    }
+    private void SubscribeToTheChannel(string Channel, string ChannelToken)
+    {
+        var request = new SubscribeRequest {
+            Data = new SubscribeRequestData { Channel = Channel, Token = ChannelToken },
+        };
+        var payload = JsonConvert.SerializeObject(request);
+        Socket.SendAsync(
+            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
+            WebSocketMessageType.Text,
+            true,
+            CancellationToken.None
+        ).GetAwaiter().GetResult();
+        Logger.Debug("Subscribe request has been sent");
+
+        var buf = new ArraySegment<byte>(new byte[BufferSize]);
 
         for (int i = 0; i < 2; i++)
         {
-            var result = this.socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
-            this.Debug("Subscribe response resieved");
+            var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+            Logger.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                this.socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-                this.Debug(result.CloseStatusDescription);
+                Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+                Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
                 throw new Exception("Socket has closed connection");
             }
             var jsonResponse = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-            this.Debug("Subscribe response", jsonResponse);
-            var subscribeResponse = JsonConvert.DeserializeObject<ChannelSocketSubscribeResponse>(jsonResponse);
-            if (subscribeResponse.id != 0)
+            Logger.Debug("Subscribe response", jsonResponse);
+            var response = JsonConvert.DeserializeObject<SubscribeResponse>(jsonResponse);
+            if (response.Id != 0)
                 continue;
-            if (subscribeResponse.result.channel != channel)
+            if (response.Data.Channel != Channel)
                 throw new Exception("Cannot subscribe to the channel");
             break;
         }
-
-        this.Debug("Subscribed to the channel", channel);
+        
+        Logger.Debug("Subscribed to the channel", Channel);
+        Observer.Dispatch(EventSubscribed, new Dictionary<string, string> { { "channel", Channel } });
     }
 
-    private string ObtainSocketClientId(ClientWebSocket ws)
+    private class SocketClientRequest
     {
-        string socketToken = CPH.GetGlobalVar<string>("daSocketToken");
-        if (socketToken == string.Empty)
+        [JsonProperty("id")]
+        public int Id = 1;
+        [JsonProperty("params")]
+        public SocketClientRequestParams Parameters { get; set; }
+    }
+    private class SocketClientRequestParams
+    {
+        [JsonProperty("token")]
+        public string Token { get; set; }
+    }
+    private class SocketClientResponse
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+        [JsonProperty("result")]
+        public SocketClientResponseData Data { get; set; }
+    }
+    private class SocketClientResponseData
+    {
+        [JsonProperty("client")]
+        public string Client;
+        [JsonProperty("version")]
+        public string Version;
+    }
+    private class SubscribeRequest
+    {
+        [JsonProperty("id")]
+        public int Id = 2;
+        [JsonProperty("method")]
+        public int Method = 1;
+        [JsonProperty("params")]
+        public SubscribeRequestData Data { get; set; }
+    }
+    private class SubscribeRequestData
+    {
+        [JsonProperty("channel")]
+        public string Channel { get; set; }
+        [JsonProperty("token")]
+        public string Token { get; set; }
+    }
+    private class SubscribeResponse
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+        [JsonProperty("result")]
+        public SubscribeResponseData Data { get; set; }
+    }
+    private class SubscribeResponseData
+    {
+        [JsonProperty("recoverable")]
+        public bool IsRecoverable = false;
+        [JsonProperty("seq")]
+        public int seq = 0;
+        [JsonProperty("type")]
+        public int Type { get; set; }
+        [JsonProperty("channel")]
+        public string Channel { get; set; }
+    }
+    private class DonationResponse
+    {
+        [JsonProperty("channel")]
+        public string Channel { get; set; }
+        [JsonProperty("data")]
+        public DonationResponseData Data = new DonationResponseData();
+    }
+    private class DonationResponseData
+    {
+        [JsonProperty("seq")]
+        public int Seq { get; set; }
+        [JsonProperty("data")]
+        public DonationData Donation = new DonationData();
+    }
+    private class DonationData
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+        [JsonProperty("name")]
+        public string Name { get; set; }
+        [JsonProperty("username")]
+        public string UserName { get; set; }
+        [JsonProperty("message")]
+        public string Message { get; set; }
+        [JsonProperty("amount")]
+        public double Amount { get; set; }
+        [JsonProperty("currency")]
+        public string Currency { get; set; }
+        [JsonProperty("amount_in_user_currency")]
+        public double AmountInUserCurrency { get; set; }
+
+        public Dictionary<string, string> ToDictionary()
         {
-            this.Debug("Socket token is empty. Cannot Perform");
-            throw new Exception("Empty socket token");
+            return new Dictionary<string, string>
+            {
+                { "id", Id.ToString() },
+                { "name", Name },
+                { "username", UserName },
+                { "message", Message },
+                { "amount", Amount.ToString() },
+                { "currency", Currency },
+                { "amount_in_user_currency", AmountInUserCurrency.ToString() },
+            };
         }
-        var request = "{\"id\":1,\"params\":{\"token\":\"" + socketToken + "\"}}";
-        this.Debug("Socket auth request", request);
-        this.Debug("accessToken", CPH.GetGlobalVar<string>("daAccessToken"));
-        ws.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(request)),
-            WebSocketMessageType.Text,
-            true,
-            CancellationToken.None
-        ).GetAwaiter().GetResult();
+    }
+}
+public class Service
+{
+    public delegate string HandleCode(string code);
 
-        var buf = new ArraySegment<byte>(new byte[1024]);
-        var result = ws.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
-        this.Debug("Auth response resieved");
-        if (result.MessageType == WebSocketMessageType.Close)
+    private const string RedirectUrl  = "http://127.0.0.1:8554/donationAlertsRedirectUri/";
+    private const string DefaultScope = "oauth-donation-index oauth-user-show oauth-donation-subscribe";
+
+    private const string EndpointAuthorize   = "/oauth/authorize";
+    private const string EndpointToken       = "/oauth/token";
+    private const string EndpointProfileInfo = "/api/v1/user/oauth";
+    private const string EndpointSubscribe   = "/api/v1/centrifuge/subscribe";
+
+    // Вы можете изменить эти значения, если необходимо
+    // см. https://www.donationalerts.com/application/clients
+    private const string ClientId     = "10462";
+    private const string ClientSecret = "nFdbaXencaGEbFizpwUyDWMuVPI49Y53Y7SGdAmw";
+    private CPHInline.PrefixedLogger Logger { get; set; }
+    private Client Client { get; set; }
+    private HttpListener Listener = null;
+
+    public Service(Client Client, CPHInline.PrefixedLogger Logger)
+    {
+        this.Client = Client;
+        this.Logger = Logger;
+    }
+    public bool ServeAndListenAuth(HandleCode Handler)
+    {
+        try
         {
-            ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-            this.Debug(result.CloseStatusDescription);
-            throw new Exception("Socket has closed connection");
+            Listener = new HttpListener();
+            Listener.Prefixes.Add(RedirectUrl);
+            Listener.Start();
+            Func<Task> func = new Func<Task>(async () => {
+                bool runServer = true;
+                while (runServer)
+                {
+                    Logger.Debug("Server is waiting ...");
+                    HttpListenerContext context = await Listener.GetContextAsync();
+                    HttpListenerRequest request = context.Request;
+                    HttpListenerResponse resp = context.Response;
+                    var queryDictionary = HttpUtility.ParseQueryString(request.Url.Query);
+                    string code = queryDictionary["code"];
+                    Handler(code);
+
+                    //TODO: Replace html page
+                    string pageData = "<!DOCTYPE><html><head><title>DONATION ALERTS TO STREAMER.BOT</title></head><body>Success! You can close this window</body></html>";
+                    byte[] data = Encoding.UTF8.GetBytes(string.Format(pageData));
+                    resp.ContentType = "text/html";
+                    resp.ContentEncoding = Encoding.UTF8;
+                    resp.ContentLength64 = data.LongLength;
+                    await context.Response.OutputStream.WriteAsync(data, 0, data.Length);
+                    resp.Close();
+                    runServer = false;
+                    Listener.Close();
+                }
+            });
+            Task listenTask = func.Invoke();
+            var forceCloseTimer = new System.Timers.Timer(30000);
+            forceCloseTimer.Elapsed += ForceCloseServer;
+            forceCloseTimer.AutoReset = true;
+            forceCloseTimer.Enabled = true;
+
+            listenTask.GetAwaiter().GetResult();
+            Listener.Close();
         }
-        this.Debug("Recieved auth message");
-        var authResponse = JsonConvert.DeserializeObject<SocketAuthResponse>(Encoding.ASCII.GetString(buf.Array, 0, result.Count));
+        catch (WebException e)
+        {
+            Logger.Debug(e.Status.ToString());
+            return false;
+        }
 
-        return authResponse.result.client;
+        return true;
     }
-
-    private bool IsValidDonation(DonationData donation)
+    public string GetAuthLink()
     {
-        return donation.amount > 0;
+        string url = Client.TargetHost + EndpointAuthorize;
+        return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), DefaultScope);
     }
-
-    private void ExportDonation(DonationData donation)
+    public ProfileInfoData GetProfileInfo(string accessToken)
     {
-        string username = "Anonymous";
-        if (!string.IsNullOrEmpty(donation.username))
-            username = donation.username;
+        var headers = new Dictionary<string, string>
+        {
+            { "Authorization", "Bearer " + accessToken }
+        };
 
-        CPH.SetArgument("daName", donation.name);
-        CPH.SetArgument("daUsername", username);
-        CPH.SetArgument("daMessage", donation.message);
-        CPH.SetArgument("daAmount", donation.amount);
-        CPH.SetArgument("daCurrency", donation.currency);
-        CPH.SetArgument("daAmountConverted", donation.amount_in_user_currency);
+        try
+        {
+            string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers);
+            ProfileInfoResponse profile = JsonConvert.DeserializeObject<ProfileInfoResponse>(json);
+            Logger.Debug("Retrieved user profile info", profile.Data.Id, json);
+
+            return profile.Data;
+        }
+        catch (WebException e)
+        {
+            LogWebError(e);
+            throw e;
+        }
+    }
+    public TokenResponse ObtainToken(string Code)
+    {
+        var values = new Dictionary<string, string>
+        {
+            { "grant_type", "authorization_code" },
+            { "client_id", ClientId },
+            { "client_secret", ClientSecret },
+            { "code", Code },
+            { "redirect_uri", RedirectUrl }
+        };
+
+        try
+        {
+            string json = Client.POST(EndpointToken, values);
+            Logger.Debug("Request to the token API has been performed");
+            TokenResponse tokenData = JsonConvert.DeserializeObject<TokenResponse>(json);
+
+            return tokenData;
+        }
+        catch (WebException e)
+        {
+            LogWebError(e);
+            return null;
+        }
+    }
+    public TokenResponse RefreshToken(string refreshToken)
+    {
+        var values = new Dictionary<string, string>
+        {
+            { "grant_type", "refresh_token" },
+            { "client_id", ClientId },
+            { "client_secret", ClientSecret },
+            { "refresh_token", refreshToken },
+            { "scope", DefaultScope }
+        };
+
+        try
+        {
+            string json = Client.POST(EndpointToken, values);
+            Logger.Debug("Request to the token API has been performed");
+            return JsonConvert.DeserializeObject<TokenResponse>(json);
+        }
+        catch (WebException e)
+        {
+            LogWebError(e);
+            return null;
+        }
+    }
+    public ChannelSubscribeResponse ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
+    {
+        var request = new ChannelSubscribeRequest
+        {
+            Client = SocketClientId,
+            Channels = new List<string>() {{ string.Format("[$alerts:donation_{0}]", UserId) }}
+        };
+        string payload = JsonConvert.SerializeObject(request);
+
+        var headers = new Dictionary<string, string>
+        {
+            { "Authorization", "Bearer " + AccessToken }
+        };
+
+        try
+        {
+            var response = Client.POST(EndpointSubscribe, payload, headers);
+            var channels = JsonConvert.DeserializeObject<Dictionary<string, List<ChannelSubscribeResponse>>>(response);
+            if (channels["channels"].Count == 0)
+                throw new Exception("Cannot fetch channels and it's tokens");
+
+            return channels["channels"][0];
+        }
+        catch (WebException e)
+        {
+            LogWebError(e);
+            throw e;
+        }
     }
 
-    #region Client Methods
-    private string PerformGET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers)
+    private void LogWebError(WebException e)
+    {
+        var response = (HttpWebResponse)e.Response;
+        var statusCodeResponse = response.StatusCode;
+        int statusCodeResponseAsInt = ((int)response.StatusCode);
+        Logger.Debug("status code : " + statusCodeResponseAsInt.ToString() + " " + statusCodeResponse);
+    }
+    private string GetEncodedRedirectUri()
+    {
+        return HttpUtility.UrlEncode(RedirectUrl);
+    }
+    private void ForceCloseServer(Object source, ElapsedEventArgs e)
+    {
+        Logger.Debug("Timer invoked");
+        if (Listener != null && Listener.IsListening)
+        {
+            Listener.Close();
+            Logger.Debug("Server has been closed by timeout");
+        }
+    }
+
+    public class TokenResponse
+    {
+        [JsonProperty("access_token")]
+        public string AccessToken { get; set; }
+        [JsonProperty("refresh_token")]
+        public string RefreshToken { get; set; }
+        [JsonProperty("expires_in")]
+        public int ExpiresIn { get; set; }
+    }
+    public class ProfileInfoResponse
+    {
+        [JsonProperty("data")]
+        public ProfileInfoData Data;
+    }
+    public class ProfileInfoData
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+        [JsonProperty("code")]
+        public string Code { get; set; }
+        [JsonProperty("name")]
+        public string Name { get; set; }
+        [JsonProperty("avatar")]
+        public string Avatar { get; set; }
+        [JsonProperty("email")]
+        public string Email { get; set; }
+        [JsonProperty("socket_connection_token")]
+        public string SocketConnectionToken;
+    }
+    public class ChannelSubscribeResponse
+    {
+        [JsonProperty("channel")]
+        public string Channel;
+        [JsonProperty("token")]
+        public string Token;
+    }
+    public class ChannelSubscribeRequest
+    {
+        [JsonProperty("client")]
+        public string Client { get; set; }
+        [JsonProperty("channels")]
+        public List<string> Channels { get; set; }
+    }
+}
+public class Client
+{
+    public const string TargetHost = "https://www.donationalerts.com";
+
+    public string GET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers)
     {
         var queryParams = new List<string>();
         foreach (var parameter in parameters)
@@ -487,34 +745,34 @@ public class CPHInline
             queryParams.Add(string.Format("{0}={1}", parameter.Key, parameter.Value));
         }
         endpoint += "?" + String.Join("&", queryParams);
-        return this.PerformRequest("GET", this.targetHost + endpoint, new Dictionary<string, string>(), headers);
+        return this.Perform(WebRequestMethods.Http.Get, TargetHost + endpoint, new Dictionary<string, string>(), headers);
     }
-    private string PerformGET(string endpoint, Dictionary<string, string> parameters)
+    public string GET(string endpoint, Dictionary<string, string> parameters)
     {
-        return this.PerformGET(endpoint, parameters, new Dictionary<string, string>());
+        return this.GET(endpoint, parameters, new Dictionary<string, string>());
     }
-    private string PerformGET(string endpoint)
+    public string GET(string endpoint)
     {
-        return this.PerformGET(endpoint, new Dictionary<string, string>());
+        return this.GET(endpoint, new Dictionary<string, string>());
     }
-    private string PerformPOST(string endpoint, string payload, Dictionary<string, string> headers)
+    public string POST(string endpoint, string payload, Dictionary<string, string> headers)
     {
-        return this.PerformRequest("POST", this.targetHost + endpoint, payload, headers);
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers);
     }
-    private string PerformPOST(string endpoint, Dictionary<string, string> payload, Dictionary<string, string> headers)
+    public string POST(string endpoint, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
-        return this.PerformRequest("POST", this.targetHost + endpoint, payload, headers);
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers);
     }
-    private string PerformPOST(string endpoint, Dictionary<string, string> payload)
+    public string POST(string endpoint, Dictionary<string, string> payload)
     {
-        return this.PerformPOST(endpoint, payload, new Dictionary<string, string>());
+        return this.POST(endpoint, payload, new Dictionary<string, string>());
     }
-    private string PerformPOST(string endpoint)
+    public string POST(string endpoint)
     {
-        return this.PerformPOST(endpoint, new Dictionary<string, string>());
+        return this.POST(endpoint, new Dictionary<string, string>());
     }
 
-    private string PerformRequest(string method, string url, string jsonPayload, Dictionary<string, string> headers)
+    private string Perform(string method, string url, string jsonPayload, Dictionary<string, string> headers)
     {
         HttpWebRequest webRequest = (HttpWebRequest)WebRequest.Create(url);
         webRequest.Method = method;
@@ -536,8 +794,6 @@ public class CPHInline
 
 
         var response = (HttpWebResponse)webRequest.GetResponse();
-        var statusCodeResponse = response.StatusCode;
-        this.Debug("status code : " + statusCodeResponse);
         string json = "";
         using (Stream respStr = response.GetResponseStream())
         {
@@ -550,192 +806,40 @@ public class CPHInline
 
         return json;
     }
-    private string PerformRequest(string method, string url, Dictionary<string, string> payload, Dictionary<string, string> headers)
+    private string Perform(string method, string url, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
         string payloadString = "";
         if (payload.Count > 0)
             payloadString = JsonConvert.SerializeObject(payload);
 
-
-        return this.PerformRequest(method, url, payloadString, headers);
+        return this.Perform(method, url, payloadString, headers);
     }
-    #endregion
+}
+public class EventObserver
+{
+    public delegate void Handler(string Event, Dictionary<string, string> Data = null);
+    private Dictionary<string, List<Handler>> Handlers { get; set; }
 
-    #region Helpers and system methods
-    private string GetEncodedRedirectUri()
+    public EventObserver()
     {
-        return HttpUtility.UrlEncode(this.redirectUrl);
+        Handlers = new Dictionary<string, List<Handler>>();
     }
-
-    private async Task HandleIncomingConnections()
+    public EventObserver Subscribe(string EventName, Handler handler)
     {
-        bool runServer = true;
-        while (runServer)
+        if (!Handlers.ContainsKey(EventName))
+            Handlers.Add(EventName, new List<Handler>());
+
+        Handlers[EventName].Add(handler);
+        return this;
+    }
+    public void Dispatch(string EventName, Dictionary<string, string> Data = null)
+    {
+        if (!Handlers.ContainsKey(EventName) || Handlers[EventName].Count == 0)
+            return;
+
+        foreach (var handler in Handlers[EventName])
         {
-            this.Debug("Server Waiting ...");
-            HttpListenerContext context = await listener.GetContextAsync();
-            HttpListenerRequest request = context.Request;
-            HttpListenerResponse resp = context.Response;
-            var queryDictionary = HttpUtility.ParseQueryString(request.Url.Query);
-            string code = queryDictionary["code"];
-            CPH.SetGlobalVar("daCode", code, true);
-            string pageData = "<!DOCTYPE><html><head><title>DONATION ALERTS TO STREAMER.BOT</title></head><body>Success! You can close this window</body></html>";
-            byte[] data = Encoding.UTF8.GetBytes(String.Format(pageData));
-            resp.ContentType = "text/html";
-            resp.ContentEncoding = Encoding.UTF8;
-            resp.ContentLength64 = data.LongLength;
-            await context.Response.OutputStream.WriteAsync(data, 0, data.Length);
-            this.Debug("code : " + code);
-            resp.Close();
-            runServer = false;
-            listener.Close();
+            handler(EventName, Data);
         }
-    }
-    #endregion
-
-    #region Logs
-    private void Debug(string message, params Object[] additional)
-    {
-        string finalMessage = message;
-        foreach (var line in additional)
-        {
-            finalMessage += ", " + line;
-        }
-        this.Debug(finalMessage);
-    }
-    private void Debug(string message)
-    {
-        message = string.Format("-- {0}: {1}", "Donation Alerts", message);
-        CPH.LogDebug(message);
-    }
-    #endregion
-
-    public class ChannelSubscribeResponseItem
-    {
-        public string channel;
-        public string token;
-    }
-
-    public class ChannelSocketSubscribeResponse
-    {
-        public int id;
-        public ChannelSocketSubscribeResponseBody result;
-    }
-
-    public class ChannelSocketSubscribeResponseBody
-    {
-        public bool recoverable = false;
-        public int seq = 0;
-        public int type;
-        public string channel;
-    }
-
-    public class SocketAuthResponse
-    {
-        public int id;
-        public SocketAuthParamResult result;
-    }
-
-    public class SocketAuthParamResult
-    {
-        public string client;
-        public string version;
-    }
-
-    public class ProfileInfoResponse
-    {
-        public ProfileInfo data;
-    }
-
-    public class ProfileInfo
-    {
-        public int id;
-        public string code;
-        public string name;
-        public string avatar;
-        public string email;
-        public string socket_connection_token;
-    }
-
-    public class DonationEvent
-    {
-        public string channel { get; set; }
-        public DonationItem data = new DonationItem();
-    }
-
-    public class DonationItem
-    {
-        public int seq;
-        public DonationData data = new DonationData();
-    }
-
-    public class DonationData
-    {
-        public int id;
-        public string name;
-        public string username;
-        public string message;
-        public double amount;
-        public string currency;
-        public double amount_in_user_currency;
-    }
-
-    public GitHubReleaseResponse GetNewerGitHubVersion(double currentVersion)
-    {
-        var newer = this.FetchLatestGitHubVersion();
-        if (newer == null)
-            return null;
-
-        var numericVersion = Convert.ToDouble(newer.tag_name.Substring(1).Replace('.', ','));
-        if (currentVersion >= numericVersion)
-            return null;
-
-        return newer;
-    }
-
-    public GitHubReleaseResponse FetchLatestGitHubVersion()
-    {
-        try
-        {
-            var releases = this.GetGitHubReleaseVersionsAsync();
-            foreach (var release in releases)
-            {
-                if (release.draft || release.prerelease)
-                    continue;
-
-                return release;
-            }
-        } catch (Exception e)
-        {
-            this.Debug("Cannot fetch versions of integration. Error: " + e.Message);
-            throw e;
-        }
-
-        return null;
-    }
-
-    private List<GitHubReleaseResponse> GetGitHubReleaseVersionsAsync()
-    {
-        try
-        {
-            WebClient webClient = new WebClient();
-            webClient.Headers.Add("User-Agent", "StreamerBot DA Integration");
-            Uri uri = new Uri(RepoReleasesAPIEndpoint);
-            string releases = webClient.DownloadString(uri);
-
-            return JsonConvert.DeserializeObject<List<GitHubReleaseResponse>>(releases);
-        } catch (Exception)
-        {
-        }
-        return new List<GitHubReleaseResponse>();
-    }
-
-    public class GitHubReleaseResponse
-    {
-        public string html_url { get; set; }
-        public string tag_name { get; set; }
-        public string name { get; set; }
-        public bool prerelease { get; set; }
-        public bool draft { get; set; }
     }
 }

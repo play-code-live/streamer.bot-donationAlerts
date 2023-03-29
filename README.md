@@ -15,12 +15,20 @@
 
 ## Обновление
 
-1. На вкладке **Actions** удалите действие `-- DonationAlerts Code`
-1. Загрузите свежую версию файла импорта **update.sb** со [страницы релизов](https://github.com/play-code-live/streamer.bot-donationAlerts/releases)
-2. Откройте Streamer.bot и нажмите кнопку Import
-3. Перетащите курсором мыши загруженный файл **update.sb** в область **Import String**, или скопируйте его содержимое и вставьте вручную
-4. Нажмите кнопку Import
-6. Перейдите в чат вашего канала и введите команду `!da_start`.
+1. На вкладке **Actions** удалите следующие действия, при их наличии:
+   * `-- DonationAlerts Autorization`
+   * `-- DonationAlerts AutoStart`
+   * `-- DonationAlerts Background Watcher`
+   * `-- DonationAlerts Code`
+   * `-- DonationAlerts Enable Background Watcher`
+   * `-- DonationAlerts Get Socket Token`
+   * `-- DonationAlerts Init`
+2. Загрузите свежую версию файла импорта **update.sb** со [страницы релизов](https://github.com/play-code-live/streamer.bot-donationAlerts/releases)
+3. Перезагрузите Streamer.bot (необходимо для завершения процесса `-- DonationAlerts Background Watcher`)
+4. Откройте Streamer.bot и нажмите кнопку Import
+5. Перетащите курсором мыши загруженный файл **update.sb** в область **Import String**, или скопируйте его содержимое и вставьте вручную
+6. Нажмите кнопку Import
+7. Перезагрузите Streamer.bot или перейдите в чат вашего канала и введите команду `!da_start`. Если потребуется авторизация - введите `!da_connect`
 
 ## Структура
 
@@ -34,7 +42,7 @@
 
 * `--DonationAlerts Code` - Содержит основной код интеграции, который вызывается посредством **Call C# Method** в Streamer.bot
 * `--DonationAlerts Authorization` - Основная логика авторизации в сервисе. Вызывается вводом команды `!da_connect`
-* `--DonationAlerts Get Socket Token` - Логика получения ключей доступа для сокета. Вызывается автоматически после авторизации. Так же получает ключ обновления токена, что позволяет не выполнять повторый вход в сервис
+* `--DonationAlerts Enable Background Watcher` - Активирует действия `Init` и `Background Watcher` для работы интеграции и автоматического запуска.
 * `--DonationAlerts Background Watcher` - Фоновое действие, отслеживающее появление новых донатов. Всегда должно находиться в очереди. Для ручной постановки в очередь, введите команду `!da_start`
 * `--DonationAlerts Autostart` - Обеспечивает безопасный запуск кода отслеживания донатов
 * `--DonationAlerts Init` - Автоматически запускает код отслеживания донатов на запуске streamer.bot
