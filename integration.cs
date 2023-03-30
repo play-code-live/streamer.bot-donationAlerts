@@ -27,7 +27,27 @@ public class CPHInline
         {
             this._CPH = _CPH;
         }
-
+        public void WebError(WebException e)
+        {
+            var response = (HttpWebResponse)e.Response;
+            var statusCodeResponse = response.StatusCode;
+            int statusCodeResponseAsInt = ((int)response.StatusCode);
+            Error("WebException with status code " + statusCodeResponseAsInt.ToString(), statusCodeResponse);
+        }
+        public void Error(string message)
+        {
+            message = string.Format("{0} {1}", Prefix, message);
+            _CPH.LogWarn(message);
+        }
+        public void Error(string message, params Object[] additional)
+        {
+            string finalMessage = message;
+            foreach (var line in additional)
+            {
+                finalMessage += ", " + line;
+            }
+            this.Error(finalMessage);
+        }
         public void Debug(string message)
         {
             message = string.Format("{0} {1}", Prefix, message);
@@ -54,8 +74,8 @@ public class CPHInline
     public void Init()
     {
         CPH.ExecuteMethod("DonationAlert Update Checker", "CheckAndAnnounce");
-        Logger   = new PrefixedLogger(CPH);
-        Service  = new Service(new Client(), Logger);
+        Logger = new PrefixedLogger(CPH);
+        Service = new Service(new Client(), Logger);
 
         SocketService = new SocketService(Service, Logger);
     }
@@ -102,7 +122,7 @@ public class CPHInline
         if (args.ContainsKey("refresh_token_recursion_protection"))
             return false;
         Logger.Debug("Refreshing access token");
-        
+
         string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
         if (refreshToken == "")
         {
@@ -177,7 +197,7 @@ public class CPHInline
                 }
             });
 
-        
+
         SocketService.Start(accessToken);
         return true;
     }
@@ -200,26 +220,26 @@ public class SocketService
 {
     private const string SocketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
 
-    public const string EventStarted      = "started";
-    public const string EventConnected    = "connected";
+    public const string EventStarted = "started";
+    public const string EventConnected = "connected";
     public const string EventDisconnected = "disconnected";
-    public const string EventReconnected  = "reconnected";
-    public const string EventAuthorized   = "authorized";
-    public const string EventSubscribed   = "subscribed";
+    public const string EventReconnected = "reconnected";
+    public const string EventAuthorized = "authorized";
+    public const string EventSubscribed = "subscribed";
 
-    public const string EventRecievedMessage  = "recieved_message";
+    public const string EventRecievedMessage = "recieved_message";
     public const string EventRecievedDonation = "recieved_donation";
     private EventObserver Observer { get; set; }
     private Service DaService { get; set; }
     private ClientWebSocket Socket { get; set; }
     private CPHInline.PrefixedLogger Logger { get; set; }
 
-    private const int BufferSize     = 2048;
+    private const int BufferSize = 3072;
 
     public SocketService(Service service, CPHInline.PrefixedLogger Logger)
     {
-        Observer    = new EventObserver();
-        DaService   = service;
+        Observer = new EventObserver();
+        DaService = service;
         this.Logger = Logger;
     }
     public SocketService On(string EventName, EventObserver.Handler handler)
@@ -243,7 +263,7 @@ public class SocketService
             Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", "manual" } });
         }
         catch (Exception) { }
-        
+
     }
     private Task ConnectAndProccess(string AccessToken, bool isReconnected = false)
     {
@@ -347,7 +367,8 @@ public class SocketService
     }
     private void SubscribeToTheChannel(string Channel, string ChannelToken)
     {
-        var request = new SubscribeRequest {
+        var request = new SubscribeRequest
+        {
             Data = new SubscribeRequestData { Channel = Channel, Token = ChannelToken },
         };
         var payload = JsonConvert.SerializeObject(request);
@@ -380,7 +401,7 @@ public class SocketService
                 throw new Exception("Cannot subscribe to the channel");
             break;
         }
-        
+
         Logger.Debug("Subscribed to the channel", Channel);
         Observer.Dispatch(EventSubscribed, new Dictionary<string, string> { { "channel", Channel } });
     }
@@ -495,17 +516,17 @@ public class Service
 {
     public delegate string HandleCode(string code);
 
-    private const string RedirectUrl  = "http://127.0.0.1:8554/donationAlertsRedirectUri/";
+    private const string RedirectUrl = "http://127.0.0.1:8554/donationAlertsRedirectUri/";
     private const string DefaultScope = "oauth-donation-index oauth-user-show oauth-donation-subscribe";
 
-    private const string EndpointAuthorize   = "/oauth/authorize";
-    private const string EndpointToken       = "/oauth/token";
+    private const string EndpointAuthorize = "/oauth/authorize";
+    private const string EndpointToken = "/oauth/token";
     private const string EndpointProfileInfo = "/api/v1/user/oauth";
-    private const string EndpointSubscribe   = "/api/v1/centrifuge/subscribe";
+    private const string EndpointSubscribe = "/api/v1/centrifuge/subscribe";
 
     // Вы можете изменить эти значения, если необходимо
     // см. https://www.donationalerts.com/application/clients
-    private const string ClientId     = "10462";
+    private const string ClientId = "10462";
     private const string ClientSecret = "nFdbaXencaGEbFizpwUyDWMuVPI49Y53Y7SGdAmw";
     private CPHInline.PrefixedLogger Logger { get; set; }
     private Client Client { get; set; }
@@ -585,7 +606,7 @@ public class Service
         }
         catch (WebException e)
         {
-            LogWebError(e);
+            Logger.WebError(e);
             throw e;
         }
     }
@@ -610,7 +631,7 @@ public class Service
         }
         catch (WebException e)
         {
-            LogWebError(e);
+            Logger.WebError(e);
             return null;
         }
     }
@@ -633,7 +654,7 @@ public class Service
         }
         catch (WebException e)
         {
-            LogWebError(e);
+            Logger.WebError(e);
             return null;
         }
     }
@@ -642,7 +663,7 @@ public class Service
         var request = new ChannelSubscribeRequest
         {
             Client = SocketClientId,
-            Channels = new List<string>() {{ string.Format("[$alerts:donation_{0}]", UserId) }}
+            Channels = new List<string>() { { string.Format("[$alerts:donation_{0}]", UserId) } }
         };
         string payload = JsonConvert.SerializeObject(request);
 
@@ -662,18 +683,11 @@ public class Service
         }
         catch (WebException e)
         {
-            LogWebError(e);
+            Logger.WebError(e);
             throw e;
         }
     }
 
-    private void LogWebError(WebException e)
-    {
-        var response = (HttpWebResponse)e.Response;
-        var statusCodeResponse = response.StatusCode;
-        int statusCodeResponseAsInt = ((int)response.StatusCode);
-        Logger.Debug("status code : " + statusCodeResponseAsInt.ToString() + " " + statusCodeResponse);
-    }
     private string GetEncodedRedirectUri()
     {
         return HttpUtility.UrlEncode(RedirectUrl);
