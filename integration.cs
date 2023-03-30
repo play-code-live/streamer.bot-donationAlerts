@@ -206,13 +206,29 @@ public class CPHInline
         string username = "Anonymous";
         if (!string.IsNullOrEmpty(Donation["username"]))
             username = Donation["username"];
+        string type = Donation["type"];
 
         CPH.SetArgument("daName", Donation["name"]);
         CPH.SetArgument("daUsername", username);
-        CPH.SetArgument("daMessage", Donation["message"]);
+        CPH.SetArgument("daType", type);
+        if (type == SocketService.DonationData.TypeText)
+            CPH.SetArgument("daMessage", Donation["content"]);
+        else if (type == SocketService.DonationData.TypeAudio)
+            CPH.SetArgument("daAudio", SaveFileToTemp(Donation["content"], Donation["id"] + ".wav"));
         CPH.SetArgument("daAmount", Donation["amount"]);
         CPH.SetArgument("daCurrency", Donation["currency"]);
         CPH.SetArgument("daAmountConverted", Donation["amount_in_user_currency"]);
+    }
+
+    private string SaveFileToTemp(string fileUrl, string name)
+    {
+        string targetPath = Path.Combine(Path.GetTempPath(), name);
+        using (var client = new WebClient())
+        {
+            client.DownloadFile(fileUrl, targetPath);
+        }
+
+        return targetPath;
     }
 }
 
@@ -220,14 +236,14 @@ public class SocketService
 {
     private const string SocketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
 
-    public const string EventStarted = "started";
-    public const string EventConnected = "connected";
+    public const string EventStarted      = "started";
+    public const string EventConnected    = "connected";
     public const string EventDisconnected = "disconnected";
-    public const string EventReconnected = "reconnected";
-    public const string EventAuthorized = "authorized";
-    public const string EventSubscribed = "subscribed";
+    public const string EventReconnected  = "reconnected";
+    public const string EventAuthorized   = "authorized";
+    public const string EventSubscribed   = "subscribed";
 
-    public const string EventRecievedMessage = "recieved_message";
+    public const string EventRecievedMessage  = "recieved_message";
     public const string EventRecievedDonation = "recieved_donation";
     private EventObserver Observer { get; set; }
     private Service DaService { get; set; }
@@ -480,12 +496,17 @@ public class SocketService
         [JsonProperty("data")]
         public DonationData Donation = new DonationData();
     }
-    private class DonationData
+    public class DonationData
     {
+        public const string TypeAudio = "audio";
+        public const string TypeText  = "text";
+
         [JsonProperty("id")]
         public int Id { get; set; }
         [JsonProperty("name")]
         public string Name { get; set; }
+        [JsonProperty("message_type")]
+        public string Type { get; set; }
         [JsonProperty("username")]
         public string UserName { get; set; }
         [JsonProperty("message")]
@@ -504,7 +525,8 @@ public class SocketService
                 { "id", Id.ToString() },
                 { "name", Name },
                 { "username", UserName },
-                { "message", Message },
+                { "type", Type },
+                { "content", Message },
                 { "amount", Amount.ToString() },
                 { "currency", Currency },
                 { "amount_in_user_currency", AmountInUserCurrency.ToString() },
