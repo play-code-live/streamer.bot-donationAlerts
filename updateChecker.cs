@@ -10,9 +10,9 @@ using System.Collections.Generic;
 ///   Email:      info@play-code.live
 ///   Repository: https://github.com/play-code-live/streamer.bot-donationAlerts
 ///----------------------------------------------------------------------------
-public class CPHInline1
+public class CPHInline
 {
-    private const double CurrentVersion = 0.5;
+    private const double CurrentVersion = 0.6;
     private const string RepoReleasesAPIEndpoint = "https://api.github.com/repos/play-code-live/streamer.bot-donationAlerts/releases?per_page=100";
 
     public bool IsUpdateAvailable()
