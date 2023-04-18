@@ -8,6 +8,7 @@ using Newtonsoft.Json;
 using System.Collections.Generic;
 using System.Net.WebSockets;
 using System.Threading;
+using System.Security.Cryptography;
 using System.Timers;
 
 ///----------------------------------------------------------------------------
@@ -68,6 +69,8 @@ public class CPHInline
     private PrefixedLogger Logger { get; set; }
 
     private const string DefaultHandlerActionName = "DonationHandler_Default";
+    private const string DefaultGoalHandlerActionName = "DonationHandler_GoalHandler";
+    private const string DefaultAfterDonationHandlerActionName = "DonationHandler_After";
     private const string TextPleaseConnect = "Please connect to DonationAlerts using the Webpage that opened to obtain your token. " +
             "Для продолжения подтвердите авторизацию в появившемся окне браузера";
 
@@ -175,6 +178,10 @@ public class CPHInline
                 Logger.Debug("Connected to the socket");
                 CPH.SendMessage("DonationAlert Background Watcher is ON");
             })
+            .On(SocketService.EventAuthorized, delegate (string Event, Dictionary<string, string> Data)
+            {
+                Logger.Debug("Authorized successfully");
+            })
             .On(SocketService.EventReconnected, delegate (string Event, Dictionary<string, string> Data)
             {
                 Logger.Debug("Reconnected to the socket");
@@ -183,18 +190,27 @@ public class CPHInline
             {
                 Logger.Debug("Disconnected from the socket", Data["description"]);
             })
+            .On(SocketService.EventAuthError, delegate (string Event, Dictionary<string, string> Data)
+            {
+                CPH.SendMessage("Необходимо повторить авторизацию в DonationAlerts. Пожалуйста, введите команду !da_connect");
+            })
+            .On(SocketService.EventGoalUpdated, delegate (string Event, Dictionary<string, string> Data)
+            {
+                ExportGoal(Data);
+                if (CPH.ActionExists(DefaultGoalHandlerActionName))
+                    CPH.RunAction(DefaultGoalHandlerActionName);
+            })
             .On(SocketService.EventRecievedDonation, delegate (string Event, Dictionary<string, string> Data)
             {
                 ExportDonation(Data);
                 string targetActionName = string.Format("DonationHandler_{0}", Data["amount"]);
                 if (CPH.ActionExists(targetActionName))
-                {
                     CPH.RunAction(targetActionName, false);
-                }
                 else if (CPH.ActionExists(DefaultHandlerActionName))
-                {
                     CPH.RunAction(DefaultHandlerActionName);
-                }
+
+                if (CPH.ActionExists(DefaultAfterDonationHandlerActionName))
+                    CPH.RunAction(DefaultAfterDonationHandlerActionName);
             });
 
 
@@ -213,11 +229,24 @@ public class CPHInline
         CPH.SetArgument("daType", type);
         if (type == SocketService.DonationData.TypeText)
             CPH.SetArgument("daMessage", Donation["content"]);
-        else if (type == SocketService.DonationData.TypeAudio)
+        else if (type == SocketService.DonationData.TypeAudio) {
+            CPH.SetArgument("daAudioUrl", Donation["content"]);
             CPH.SetArgument("daAudio", SaveFileToTemp(Donation["content"], Donation["id"] + ".wav"));
+        }
+            
         CPH.SetArgument("daAmount", Donation["amount"]);
         CPH.SetArgument("daCurrency", Donation["currency"]);
         CPH.SetArgument("daAmountConverted", Donation["amount_in_user_currency"]);
+    }
+
+    private void ExportGoal(Dictionary<string, string> GoalData)
+    {
+        CPH.SetArgument("daGoalIsActive", GoalData["is_active"]);
+        CPH.SetArgument("daGoalIsDefault", GoalData["is_default"]);
+        CPH.SetArgument("daGoalTitle", GoalData["title"]);
+        CPH.SetArgument("daGoalCurrency", GoalData["currency"]);
+        CPH.SetArgument("daGoalCurrent", GoalData["current"]);
+        CPH.SetArgument("daGoalTarget", GoalData["target"]);
     }
 
     private string SaveFileToTemp(string fileUrl, string name)
@@ -242,15 +271,19 @@ public class SocketService
     public const string EventReconnected  = "reconnected";
     public const string EventAuthorized   = "authorized";
     public const string EventSubscribed   = "subscribed";
+    public const string EventAuthError    = "auth_error"; 
 
     public const string EventRecievedMessage  = "recieved_message";
     public const string EventRecievedDonation = "recieved_donation";
+    public const string EventGoalUpdated      = "goal_updated";
     private EventObserver Observer { get; set; }
     private Service DaService { get; set; }
     private ClientWebSocket Socket { get; set; }
     private CPHInline.PrefixedLogger Logger { get; set; }
 
     private const int BufferSize = 3072;
+
+    private string PreviousGoalEventHash = "";
 
     public SocketService(Service service, CPHInline.PrefixedLogger Logger)
     {
@@ -283,7 +316,20 @@ public class SocketService
     }
     private Task ConnectAndProccess(string AccessToken, bool isReconnected = false)
     {
-        var userProfile = DaService.GetProfileInfo(AccessToken);
+        Service.ProfileInfoData userProfile = null;
+        try
+        {
+            userProfile = DaService.GetProfileInfo(AccessToken);
+        } catch (WebException e)
+        {
+            var response = (HttpWebResponse)e.Response;
+            var statusCodeResponse = response.StatusCode;
+            if (statusCodeResponse == HttpStatusCode.Unauthorized)
+            {
+                Observer.Dispatch(EventAuthError);
+                throw e;
+            }
+        }
 
         Socket = new ClientWebSocket();
         Observer.Dispatch(EventStarted, null);
@@ -295,8 +341,11 @@ public class SocketService
         if (Socket.State == WebSocketState.Open)
         {
             string socketClientId = ObtainSocketClientId(userProfile.SocketConnectionToken);
-            var channelInfo = DaService.ObtainChannelSubscribeToken(AccessToken, userProfile.Id, socketClientId);
-            this.SubscribeToTheChannel(channelInfo.Channel, channelInfo.Token);
+            var channelInfoList = DaService.ObtainChannelSubscribeToken(AccessToken, userProfile.Id, socketClientId);
+            foreach (var channelInfoItem in channelInfoList)
+            {
+                this.SubscribeToTheChannel(channelInfoItem.Channel, channelInfoItem.Token);
+            }
         }
 
         try
@@ -317,14 +366,40 @@ public class SocketService
                     string rawMessage = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
                     Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
                     Logger.Debug(rawMessage);
+                    var socketMessage = JsonConvert.DeserializeObject<Dictionary<string, SocketMessage>>(rawMessage)["result"];
                     try
                     {
-                        var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationResponse>>(rawMessage);
-                        var donation = donationEvent["result"].Data.Donation;
-                        if (donation.Amount <= 0)
-                            continue;
+                        var messageType = socketMessage.RecognizeType();
+                        switch (messageType)
+                        {
+                            case SocketMessage.TypeDonation:
+                                var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationResponse>>(rawMessage);
+                                if (!donationEvent["result"].IsValid())
+                                    continue;
 
-                        Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
+                                var donation = donationEvent["result"].Data.Donation;
+                                Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
+                                break;
+                            case SocketMessage.TypeGoal:
+                                var goalEvent = JsonConvert.DeserializeObject<Dictionary<string, GoalProgressResponse>>(rawMessage);
+                                if (!goalEvent["result"].IsValid())
+                                    continue;
+
+                                var goal = goalEvent["result"].Data.GoalData;
+                                var goalHash = Helper.GetMD5Hash(goal);
+
+                                if (goalHash == PreviousGoalEventHash)
+                                {
+                                    Logger.Debug("Duplicated goal data arrived. Skipping");
+                                    continue;
+                                }
+                                    
+                                PreviousGoalEventHash = goalHash;
+
+                                Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
+                                break;
+                        }
+                        
                     }
                     catch (Exception) { }
                 }
@@ -376,7 +451,7 @@ public class SocketService
         Logger.Debug("Recieved auth message");
 
         var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(Encoding.ASCII.GetString(buffer.Array, 0, result.Count));
-
+ 
         Observer.Dispatch(EventAuthorized, new Dictionary<string, string> { { "client", authResponse.Data.Client }, { "version", authResponse.Data.Version } });
 
         return authResponse.Data.Client;
@@ -482,12 +557,41 @@ public class SocketService
         [JsonProperty("channel")]
         public string Channel { get; set; }
     }
+    private class SocketMessage
+    {
+        public const string TypeDonation = "donation";
+        public const string TypeGoal = "goal";
+        public const string TypeUnknown = "unknown";
+
+        [JsonProperty("channel")]
+        public string Channel { get; set; }
+        public string RecognizeType()
+        {
+            if (Channel.Contains("$alerts:donation"))
+            {
+                return TypeDonation;
+            }
+            else if (Channel.Contains("$goals:goal"))
+            {
+                return TypeGoal;
+            }
+            else
+            {
+                return TypeUnknown;
+            }
+        }
+    }
     private class DonationResponse
     {
         [JsonProperty("channel")]
         public string Channel { get; set; }
         [JsonProperty("data")]
         public DonationResponseData Data = new DonationResponseData();
+
+        public bool IsValid()
+        {
+            return Data.Donation.Amount > 0;
+        }
     }
     private class DonationResponseData
     {
@@ -499,7 +603,7 @@ public class SocketService
     public class DonationData
     {
         public const string TypeAudio = "audio";
-        public const string TypeText  = "text";
+        public const string TypeText = "text";
 
         [JsonProperty("id")]
         public int Id { get; set; }
@@ -518,9 +622,7 @@ public class SocketService
         [JsonProperty("amount_in_user_currency")]
         public double AmountInUserCurrency { get; set; }
 
-        public Dictionary<string, string> ToDictionary()
-        {
-            return new Dictionary<string, string>
+        public Dictionary<string, string> ToDictionary() => new Dictionary<string, string>
             {
                 { "id", Id.ToString() },
                 { "name", Name },
@@ -531,15 +633,64 @@ public class SocketService
                 { "currency", Currency },
                 { "amount_in_user_currency", AmountInUserCurrency.ToString() },
             };
+    }
+    private class GoalProgressResponse
+    {
+        [JsonProperty("channel")]
+        public string Channel { get; set; }
+        [JsonProperty("data")]
+        public GoalProgressData Data = new GoalProgressData();
+        public bool IsValid()
+        {
+            return Data.GoalData.GoalAmount > 0;
         }
     }
+    private class GoalProgressData
+    {
+        [JsonProperty("seq")]
+        public int Seq { get; set; }
+        [JsonProperty("data")]
+        public GoalData GoalData = new GoalData();
+    }
+    private class GoalData
+    {
+        [JsonProperty("id")]
+        public int Id { get; set; }
+        [JsonProperty("is_active")]
+        public bool IsActive { get; set; }
+        [JsonProperty("is_default")]
+        public bool IsDefault { get; set; }
+        [JsonProperty("title")]
+        public string Title { get; set; }
+        [JsonProperty("currency")]
+        public string Currency { get; set; }
+        [JsonProperty("raised_amount")]
+        public double RaisedAmount { get; set; }
+        [JsonProperty("goal_amount")]
+        public double GoalAmount { get; set; }
+
+        public Dictionary<string, string> ToDictionary()
+        {
+            return new Dictionary<string, string>
+            {
+                { "id", Id.ToString() },
+                { "is_active", IsActive.ToString() },
+                { "is_default", IsDefault.ToString() },
+                { "title", Title },
+                { "currency", Currency },
+                { "current", RaisedAmount.ToString() },
+                { "target", GoalAmount.ToString() },
+            };
+        }
+    }
+    
 }
 public class Service
 {
     public delegate string HandleCode(string code);
 
     private const string RedirectUrl = "http://127.0.0.1:8554/donationAlertsRedirectUri/";
-    private const string DefaultScope = "oauth-donation-index oauth-user-show oauth-donation-subscribe";
+    private const string DefaultScope = "oauth-donation-index oauth-user-show oauth-donation-subscribe oauth-goal-subscribe";
 
     private const string EndpointAuthorize = "/oauth/authorize";
     private const string EndpointToken = "/oauth/token";
@@ -680,12 +831,15 @@ public class Service
             return null;
         }
     }
-    public ChannelSubscribeResponse ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
+    public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
     {
         var request = new ChannelSubscribeRequest
         {
             Client = SocketClientId,
-            Channels = new List<string>() { { string.Format("[$alerts:donation_{0}]", UserId) } }
+            Channels = new List<string>() { 
+                { string.Format("$alerts:donation_{0}", UserId) },
+                { string.Format("$goals:goal_{0}", UserId) },
+            }
         };
         string payload = JsonConvert.SerializeObject(request);
 
@@ -701,7 +855,7 @@ public class Service
             if (channels["channels"].Count == 0)
                 throw new Exception("Cannot fetch channels and it's tokens");
 
-            return channels["channels"][0];
+            return channels["channels"];
         }
         catch (WebException e)
         {
@@ -875,6 +1029,24 @@ public class EventObserver
         foreach (var handler in Handlers[EventName])
         {
             handler(EventName, Data);
+        }
+    }
+}
+
+public static class Helper
+{
+    public static string GetMD5Hash(object obj)
+    {
+        using (var md5 = MD5.Create())
+        {
+            var json = JsonConvert.SerializeObject(obj);
+            var hashBytes = md5.ComputeHash(Encoding.UTF8.GetBytes(json));
+            var sb = new StringBuilder();
+            foreach (var b in hashBytes)
+            {
+                sb.Append(b.ToString("x2"));
+            }
+            return sb.ToString();
         }
     }
 }
