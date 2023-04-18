@@ -12,7 +12,7 @@ using System.Collections.Generic;
 ///----------------------------------------------------------------------------
 public class CPHInline
 {
-    private const double CurrentVersion = 0.6;
+    private const double CurrentVersion = 0.7;
     private const string RepoReleasesAPIEndpoint = "https://api.github.com/repos/play-code-live/streamer.bot-donationAlerts/releases?per_page=100";
 
     public bool IsUpdateAvailable()
