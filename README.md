@@ -1,5 +1,7 @@
 # DonationAlerts для Streamer.bot
 
+[![GitHub All Releases](https://img.shields.io/github/downloads/play-code-live/streamer.bot-donationAlerts/total.svg)]()
+
 Данный модуль является набором действий и комманд для интеграции с DonationAlerts.
 
 ## Установка
