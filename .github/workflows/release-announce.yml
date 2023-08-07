@@ -20,9 +20,9 @@ jobs:
       with:
         webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
         message: |
-        Новая версия интеграции **Donation Alerts + Streamer.bot**: ${{ github.event.release.tag_name }}
-        
-        ${{ steps.get_release_desc.outputs.desc }}"
+          Новая версия интеграции **Donation Alerts + Streamer.bot**: ${{ github.event.release.tag_name }}
+          
+          ${{ steps.get_release_desc.outputs.desc }}"
 
-        **Инструкция по настройке**
-        {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
+          **Инструкция по настройке**
+          {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
