@@ -15,11 +15,12 @@ jobs:
       id: get_release_desc
       run: echo "::set-output name=desc::$(curl -s <https://api.github.com/repos/$>{{ github.repository }}/releases/${{ github.event.release.id }} | jq '.body')"
 
-    - name: Send Notification to Discord
-      uses: appleboy/discord-action@master
+    - name: Discord notification
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      uses: Ilshidur/action-discord@master
       with:
-        webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
-        message: |
+        args: |
           Новая версия интеграции **Donation Alerts + Streamer.bot**: ${{ github.event.release.tag_name }}
           
           ${{ steps.get_release_desc.outputs.desc }}"
