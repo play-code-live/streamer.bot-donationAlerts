@@ -1,0 +1,18 @@
+name: Release Announcer
+on:
+  release:
+    types: [created]
+
+jobs:
+  Discord Release Announcer:
+    steps:
+      - name: Discord notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        uses: Ilshidur/action-discord@master
+        with:
+          args: |
+            Вышла новая версия интеграции DonationAlerts + Streamer.bot версия {{github.ref_name}}
+
+            Инструкция по настройке: {{github.repositoryUrl}}
+
