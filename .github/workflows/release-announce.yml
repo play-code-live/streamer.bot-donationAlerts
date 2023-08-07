@@ -4,7 +4,7 @@ on:
     types: [created]
 
 jobs:
-  Discord Release Announcer:
+  DiscordReleaseAnnouncer:
     runs-on: ubuntu-latest
     steps:
       - name: Discord notification
