@@ -13,7 +13,7 @@ jobs:
         uses: Ilshidur/action-discord@master
         with:
           args: |
-            Вышла новая версия интеграции DonationAlerts + Streamer.bot версия {{github.ref_name}}
+            Вышла новая версия интеграции DonationAlerts + Streamer.bot версия {{GITHUB_REF_NAME}}
 
-            Инструкция по настройке: {{github.repositoryUrl}}
+            Инструкция по настройке: {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
 
