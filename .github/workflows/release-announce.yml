@@ -5,6 +5,7 @@ on:
 
 jobs:
   Discord Release Announcer:
+    runs-on: ubuntu-latest
     steps:
       - name: Discord notification
         env:
