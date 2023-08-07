@@ -13,7 +13,12 @@ jobs:
 
     - name: Get Release Description
       id: get_release_desc
-      run: echo "::set-output name=desc::$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }} | jq '.body')"
+      run: |
+        description=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }} | jq '.body')
+        description="${description//'%'/'%25'}"
+        description="${description//$'\n'/'%0A'}"
+        description="${description//$'\r'/'%0D'}"
+        echo "::set-output name=desc::$description"
 
     - name: Discord notification
       env:
