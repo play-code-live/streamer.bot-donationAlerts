@@ -4,16 +4,25 @@ on:
     types: [created]
 
 jobs:
-  DiscordReleaseAnnouncer:
+  notify:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Discord notification
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        uses: Ilshidur/action-discord@master
-        with:
-          args: |
-            Вышла новая версия интеграции DonationAlerts + Streamer.bot версия {{GITHUB_REF_NAME}}
+    - name: Checkout
+      uses: actions/checkout@v2
 
-            Инструкция по настройке: {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
+    - name: Get Release Description
+      id: get_release_desc
+      run: echo "::set-output name=desc::$(curl -s <https://api.github.com/repos/$>{{ github.repository }}/releases/${{ github.event.release.id }} | jq '.body')"
 
+    - name: Send Notification to Discord
+      uses: appleboy/discord-action@master
+      with:
+        webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
+        message: |
+        Новая версия интеграции **Donation Alerts + Streamer.bot**: ${{ github.event.release.tag_name }}
+        
+        ${{ steps.get_release_desc.outputs.desc }}"
+
+        **Инструкция по настройке**
+        {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
