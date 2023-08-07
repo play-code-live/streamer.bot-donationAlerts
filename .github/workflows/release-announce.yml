@@ -13,8 +13,7 @@ jobs:
 
     - name: Get Release Description
       id: get_release_desc
-      run: |
-        echo "::set-env name=RELEASE_DESC::$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }} | jq -r '.body')"
+      run: echo "::set-output name=desc::$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }} | jq '.body')"
 
     - name: Discord notification
       env:
@@ -23,8 +22,8 @@ jobs:
       with:
         args: |
           Новая версия интеграции **Donation Alerts + Streamer.bot**: ${{ github.event.release.tag_name }}
-
-          {{ env.RELEASE_DESC }}
+          
+          ${{ steps.get_release_desc.outputs.desc }}"
 
           **Инструкция по настройке**
           {{GITHUB_SERVER_URL}}/{{GITHUB_REPOSITORY}}
