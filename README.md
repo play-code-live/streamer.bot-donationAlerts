@@ -19,14 +19,12 @@
 
 > Для тестирования исправленного C#-кода на v0.9.0 замените код в существующем Execute C# Code, скомпилируйте и сохраните его, не удаляя Actions и привязки кастомных триггеров. Инструкция ниже относится к старым импортам до v0.9.0.
 
-1. На вкладке **Actions** удалите следующие действия, при их наличии:
-   * `-- DonationAlerts Autorization`
-   * `-- DonationAlerts AutoStart`
+1. На вкладке **Actions** удалите служебные действия старой интеграции, при их наличии:
+   * `-- DonationAlerts Authorization` (в старых версиях также `-- DonationAlerts Autorization`)
    * `-- DonationAlerts Background Watcher`
    * `-- DonationAlerts Code`
    * `-- DonationAlerts Enable Background Watcher`
-   * `-- DonationAlerts Get Socket Token`
-   * `-- DonationAlerts Init`
+   * Устаревшие действия, если остались от предыдущих версий: `-- DonationAlerts AutoStart`, `-- DonationAlerts Get Socket Token`, `-- DonationAlerts Init`.
 2. Загрузите свежую версию файла импорта **update.sb** со [страницы релизов](https://github.com/play-code-live/streamer.bot-donationAlerts/releases)
 3. Перезагрузите Streamer.bot (необходимо для завершения процесса `-- DonationAlerts Background Watcher`)
 4. Откройте Streamer.bot и нажмите кнопку Import
@@ -58,22 +56,20 @@
 
 ### Служебные действия
 
-Все служебные действия размещены в группе **DonationAlerts** и имеют префикс `--DonationAlerts`. Все они плотно связаны друг с другом и не могут быть переименованны без нарушения работоспособности.
+Интеграция содержит четыре служебных действия. Все они размещены в группе **DonationAlerts** и имеют префикс `--DonationAlerts`.
 
-> **Важно!** Не переименовывайте служебные действия! Они имеют высокую зависимость друг от друга
+> **Важно!** Не переименовывайте служебные действия: они связаны друг с другом.
 
-* `--DonationAlerts Code` - Содержит основной код интеграции, который вызывается посредством **Call C# Method** в Streamer.bot
-* `--DonationAlerts Authorization` - Основная логика авторизации в сервисе. Вызывается вводом команды `!da_connect`
-* `--DonationAlerts Enable Background Watcher` - Активирует действия `Init` и `Background Watcher` для работы интеграции и автоматического запуска.
-* `--DonationAlerts Background Watcher` - Запускает фоновую задачу отслеживания донатов и сразу завершается. Не должен постоянно отображаться в **Pending Actions**. Для ручного запуска введите команду `!da_start`. Существующую очередь можно сохранить. Повторный запуск не создаёт второй watcher, пока работает предыдущий.
-* `--DonationAlerts Autostart` - Обеспечивает безопасный запуск кода отслеживания донатов
-* `--DonationAlerts Init` - Автоматически запускает код отслеживания донатов на запуске streamer.bot
+* `--DonationAlerts Authorization` — выполняет авторизацию в DonationAlerts. Запускается командой `!da_connect`.
+* `--DonationAlerts Background Watcher` — запускает фоновую задачу отслеживания донатов и сразу завершается. Не должен постоянно отображаться в **Pending Actions**. Для ручного запуска введите команду `!da_start`. Существующую очередь можно сохранить. Повторный запуск не создаёт второй watcher, пока работает предыдущий.
+* `--DonationAlerts Code` — содержит основной C#-код интеграции, методы которого вызываются через **Call C# Method** в Streamer.bot.
+* `--DonationAlerts Enable Background Watcher` — включает действие Background Watcher для работы интеграции и её автоматического запуска.
 
 ### Кастомные триггеры (v0.9.0)
 
 Начиная с v0.9.0, для обработки событий используются **Custom → DonationAlerts**, а не специальные имена Actions. Существующие привязки триггеров остаются совместимыми.
 
-Включите **Precompile on Application start** у Execute C# Code, содержащего основной код интеграции. Init регистрирует триггеры при запуске Streamer.bot, даже если DonationAlerts ещё не авторизован. Сохранённые диапазоны сумм восстанавливаются из глобальной переменной `da.donation.ranges`.
+Включите **Precompile on Application start** у Execute C# Code, содержащего основной код интеграции. Метод `Init()` основного C#-кода регистрирует триггеры при запуске Streamer.bot, даже если DonationAlerts ещё не авторизован. Сохранённые диапазоны сумм восстанавливаются из глобальной переменной `da.donation.ranges`.
 
 * **Connection**: DA: Connected, DA: Disconnected, DA: Reconnected.
 * **Donations**: DA: Any donation и триггеры для конкретных сумм/диапазонов. Передайте `daRanges` в DonationCheckerLoop (например, `100-500,400`). Приоритет: точная сумма, затем последний подходящий диапазон в порядке сортировки, иначе DA: Any donation. Это соответствует поведению v0.9.0: Any — обработчик по умолчанию, не дополнительное событие.
