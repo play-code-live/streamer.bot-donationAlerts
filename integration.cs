@@ -5,16 +5,20 @@ using System.Web;
 using System.Threading.Tasks;
 using System.IO;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Security.Cryptography;
 using System.Timers;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Globalization;
 
 ///----------------------------------------------------------------------------
 ///   Module:     DonationAlertsIntegration
 ///   Author:     play_code (https://twitch.tv/play_code)
-///   Email:      info@play-code.live
+///   Email:      info@play-code.ru
 ///   Repository: https://github.com/play-code-live/streamer.bot-donationAlerts
 ///----------------------------------------------------------------------------
 public class CPHInline
@@ -28,12 +32,16 @@ public class CPHInline
         {
             this._CPH = _CPH;
         }
-        public void WebError(WebException e)
+        public void WebError(WebException e, string operation = "HTTP request")
         {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            int statusCodeResponseAsInt = ((int)response.StatusCode);
-            Error("WebException with status code " + statusCodeResponseAsInt.ToString(), statusCodeResponse);
+            var response = e.Response as HttpWebResponse;
+            if (response == null)
+            {
+                Error(operation + " failed", e.Status);
+                return;
+            }
+
+            Error(operation + " failed", e.Status, (int)response.StatusCode, response.StatusCode);
         }
         public void Error(string message)
         {
@@ -68,26 +76,95 @@ public class CPHInline
     private SocketService SocketService { get; set; }
     private PrefixedLogger Logger { get; set; }
 
-    private const string DefaultHandlerActionName = "DonationHandler_Default";
-    private const string DefaultGoalHandlerActionName = "DonationHandler_GoalHandler";
-    private const string DefaultAfterDonationHandlerActionName = "DonationHandler_After";
+    // Keep the event IDs and global variable key from release v0.9.0.
+    private const string keyDonationRanges = "da.donation.ranges";
+    private const string
+        eventConnected = "da.connection.connected",
+        eventDisconnected = "da.connection.disconnected",
+        eventReconnected = "da.connection.reconnected",
+        eventDonationAny = "da.donation.any",
+        eventGoalUpdated = "da.goal.updated",
+        eventMediaAdd = "da.media.add";
+
+    private readonly object RangeLock = new object();
+    private List<KeyValuePair<int, int>> DonationRanges = new List<KeyValuePair<int, int>>();
+    private readonly HashSet<string> RegisteredTriggers = new HashSet<string>(StringComparer.Ordinal);
     private const string TextPleaseConnect = "Please connect to DonationAlerts using the Webpage that opened to obtain your token. " +
             "Для продолжения подтвердите авторизацию в появившемся окне браузера";
 
     public void Init()
     {
-        CPH.ExecuteMethod("DonationAlert Update Checker", "CheckAndAnnounce");
         Logger = new PrefixedLogger(CPH);
         Service = new Service(new Client(), Logger);
-
         SocketService = new SocketService(Service, Logger);
+        ConfigureSocketHandlers();
+
+        // Custom triggers are rebuilt by Streamer.bot on every application start.
+        RegisterTrigger("DA: Connected", eventConnected, new[] { "DonationAlerts", "Connection" });
+        RegisterTrigger("DA: Disconnected", eventDisconnected, new[] { "DonationAlerts", "Connection" });
+        RegisterTrigger("DA: Reconnected", eventReconnected, new[] { "DonationAlerts", "Connection" });
+        RegisterTrigger("DA: Any donation", eventDonationAny, new[] { "DonationAlerts", "Donations" });
+        RegisterTrigger("DA: Goal Updated", eventGoalUpdated, new[] { "DonationAlerts" });
+        RegisterTrigger("DA: Media Add", eventMediaAdd, new[] { "DonationAlerts", "Media" });
+        RestoreRanges();
+
+        // An update check must not prevent trigger registration.
+        try
+        {
+            CPH.ExecuteMethod("DonationAlert Update Checker", "CheckAndAnnounce");
+        }
+        catch (Exception e)
+        {
+            Logger.Error("Update checker failed", e.GetType().Name);
+        }
     }
+
+    private void RegisterTrigger(string name, string code, string[] categories)
+    {
+        try
+        {
+            if (RegisteredTriggers.Contains(code))
+                return;
+
+            if (CPH.RegisterCustomTrigger(name, code, categories))
+            {
+                RegisteredTriggers.Add(code);
+                Logger.Debug("Custom trigger registered", code);
+            }
+            else
+                Logger.Error("Custom trigger registration returned false", code);
+        }
+        catch (Exception e)
+        {
+            Logger.Error("Custom trigger registration failed", code, e.GetType().Name);
+        }
+    }
+
     public void Dispose()
     {
-        SocketService.Close();
+        // Request cancellation of both watchers; never wait on the Action thread.
+        if (SocketService != null)
+            SocketService.Close();
     }
+
+    public bool StopDonationCheckerLoop()
+    {
+        if (SocketService != null)
+            SocketService.Stop();
+        return true;
+    }
+
+    public bool StopMediaCheckerLoop()
+    {
+        if (SocketService != null)
+            SocketService.StopMedia();
+        return true;
+    }
+
     public bool CreateAuthLink()
     {
+        // Never reuse a code from an earlier authorization attempt.
+        CPH.SetGlobalVar("daCode", "", true);
         string authLink = Service.GetAuthLink();
         CPH.SendMessage(TextPleaseConnect);
         System.Diagnostics.Process.Start(authLink);
@@ -96,19 +173,21 @@ public class CPHInline
         return Service.ServeAndListenAuth(delegate (string code)
         {
             CPH.SetGlobalVar("daCode", code, true);
-            Logger.Debug("code : " + code);
+            Logger.Debug("Authorization code received");
             return code;
         });
     }
     public bool ObtainAccessToken()
     {
         string code = CPH.GetGlobalVar<string>("daCode");
-        if (code == "")
+        if (string.IsNullOrWhiteSpace(code))
         {
             Logger.Debug("Code argument has not arrivied. Make sure you initialized connection for the DA");
             return false;
         }
 
+        // Authorization codes are single-use. A failed exchange needs a new code.
+        CPH.SetGlobalVar("daCode", "", true);
         var tokenData = Service.ObtainToken(code);
         if (tokenData == null)
             return false;
@@ -127,7 +206,7 @@ public class CPHInline
         Logger.Debug("Refreshing access token");
 
         string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
-        if (refreshToken == "")
+        if (string.IsNullOrWhiteSpace(refreshToken))
         {
             Logger.Debug("RefreshToken argument has not arrived. Make sure you initialized connection for the DA");
             return false;
@@ -159,15 +238,190 @@ public class CPHInline
 
         return true;
     }
+    private void RestoreRanges()
+    {
+        lock (RangeLock)
+        {
+            try
+            {
+                string saved = CPH.GetGlobalVar<string>(keyDonationRanges, true);
+                if (string.IsNullOrWhiteSpace(saved))
+                    return;
+
+                var ranges = JsonConvert.DeserializeObject<List<KeyValuePair<int, int>>>(saved);
+                if (ranges == null)
+                    return;
+
+                ranges.RemoveAll(range => range.Key < 0 ||
+                    (range.Value != -1 && range.Value <= range.Key));
+                SortRanges(ranges);
+                DonationRanges = ranges;
+                RegisterRanges(ranges);
+            }
+            catch (Exception e)
+            {
+                Logger.Error("Cannot restore saved donation ranges", e.GetType().Name);
+            }
+        }
+    }
+
+    private static void SortRanges(List<KeyValuePair<int, int>> ranges)
+    {
+        ranges.Sort((x, y) =>
+        {
+            int first = x.Key.CompareTo(y.Key);
+            return first != 0 ? first : x.Value.CompareTo(y.Value);
+        });
+    }
+
+    private bool ValidateAndRegisterRanges(string rawRanges)
+    {
+        var ranges = new List<KeyValuePair<int, int>>();
+        foreach (var range in (rawRanges ?? "").Replace(" ", "").Split(','))
+        {
+            if (string.IsNullOrEmpty(range))
+                continue;
+
+            var parts = range.Split('-');
+            int from, to;
+            if (parts.Length == 1 && int.TryParse(parts[0], out from) && from >= 0)
+                ranges.Add(new KeyValuePair<int, int>(from, -1));
+            else if (parts.Length == 2 && int.TryParse(parts[0], out from) &&
+                int.TryParse(parts[1], out to) && from >= 0 && to >= 0)
+            {
+                if (from == to)
+                    continue;
+                if (from > to)
+                {
+                    int swap = from;
+                    from = to;
+                    to = swap;
+                }
+                ranges.Add(new KeyValuePair<int, int>(from, to));
+            }
+            else
+            {
+                Logger.Error("Invalid donation range configuration; saved ranges retained");
+                return false;
+            }
+        }
+
+        SortRanges(ranges);
+        lock (RangeLock)
+        {
+            CPH.SetGlobalVar(keyDonationRanges, JsonConvert.SerializeObject(ranges), true);
+            DonationRanges = ranges;
+            RegisterRanges(ranges);
+        }
+
+        return true;
+    }
+
+    private static string RangeId(KeyValuePair<int, int> range)
+    {
+        string from = range.Key.ToString(CultureInfo.InvariantCulture);
+        return range.Value == -1 ? from : from + "-" + range.Value.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private void RegisterRanges(List<KeyValuePair<int, int>> ranges)
+    {
+        foreach (var range in ranges)
+        {
+            string rangeString = RangeId(range);
+            RegisterTrigger("DA: Donation (" + rangeString + ")", "da.donation." + rangeString,
+                new[] { "DonationAlerts", "Donations" });
+        }
+    }
+
+    private void EmitTrigger(string eventId, Dictionary<string, object> eventArgs = null)
+    {
+        if (SocketService == null || SocketService.IsClosed)
+            return;
+
+        // Watchers outlive the Action that started them. Never read or write
+        // that Action's argument stack, or inherit its media token/other args.
+        Logger.Debug("Emitting custom trigger", eventId);
+        CPH.TriggerCodeEvent(eventId, eventArgs ?? new Dictionary<string, object>());
+        Logger.Debug("Custom trigger emitted", eventId);
+    }
+
+    private void TriggerDonationEventBySum(string amountValue, Dictionary<string, object> eventArgs)
+    {
+        decimal amount;
+        if (!decimal.TryParse(amountValue, out amount))
+        {
+            Logger.Error("Invalid donation amount for range matching");
+            EmitTrigger(eventDonationAny, eventArgs);
+            return;
+        }
+
+        // Snapshot is immutable after publishing. Preserve v0.9.0 precedence:
+        // exact amount wins, otherwise last matching sorted range, otherwise Any.
+        List<KeyValuePair<int, int>> ranges;
+        lock (RangeLock)
+            ranges = DonationRanges;
+
+        KeyValuePair<int, int>? bestMatch = null;
+        foreach (var range in ranges)
+        {
+            if (range.Value == -1 && amount == range.Key)
+            {
+                EmitTrigger("da.donation." + RangeId(range), eventArgs);
+                return;
+            }
+            if (range.Value != -1 && amount >= range.Key && amount <= range.Value)
+                bestMatch = range;
+            else if (amount < range.Key)
+                break;
+        }
+
+        EmitTrigger(bestMatch.HasValue ? "da.donation." + RangeId(bestMatch.Value) : eventDonationAny, eventArgs);
+    }
+
+    public bool MediaCheckerLoop()
+    {
+        if (SocketService == null || SocketService.IsClosed)
+            return false;
+
+        object rawToken;
+        if (!args.TryGetValue("daMediaToken", out rawToken) ||
+            string.IsNullOrWhiteSpace(rawToken == null ? null : rawToken.ToString()))
+            return false;
+
+        bool started = SocketService.StartMediaSocket(rawToken.ToString());
+        if (started)
+            Logger.Debug("MediaCheckerLoop returned; watcher is managed separately");
+        return started;
+    }
+
     public bool DonationCheckerLoop()
     {
+        if (SocketService == null || SocketService.IsClosed)
+            return false;
+
+        // Only overwrite the persisted configuration when the caller supplied daRanges.
+        // An explicit empty value still means no amount-specific triggers.
+        object rawRanges;
+        if (args.TryGetValue("daRanges", out rawRanges) &&
+            !ValidateAndRegisterRanges(rawRanges == null ? "" : rawRanges.ToString()))
+            return false;
+
         string accessToken = CPH.GetGlobalVar<string>("daAccessToken");
         if (string.IsNullOrEmpty(accessToken))
         {
             CPH.SendMessage("Необходимо выполнить авторизацию в DonationAlerts. Введите команду !da_connect");
-            throw new Exception("Unauthorized");
+            return false;
         }
 
+        bool started = SocketService.Start(accessToken);
+        if (started)
+            Logger.Debug("DonationCheckerLoop returned; watcher is managed separately");
+        return started;
+    }
+
+    // Register observers once; the donation and media watchers share this instance.
+    private void ConfigureSocketHandlers()
+    {
         SocketService
             .On(SocketService.EventStarted, delegate (string Event, Dictionary<string, string> Data)
             {
@@ -175,8 +429,7 @@ public class CPHInline
             })
             .On(SocketService.EventConnected, delegate (string Event, Dictionary<string, string> Data)
             {
-                Logger.Debug("Connected to the socket");
-                CPH.SendMessage("DonationAlert Background Watcher is ON");
+                EmitTrigger(eventConnected);
             })
             .On(SocketService.EventAuthorized, delegate (string Event, Dictionary<string, string> Data)
             {
@@ -184,11 +437,11 @@ public class CPHInline
             })
             .On(SocketService.EventReconnected, delegate (string Event, Dictionary<string, string> Data)
             {
-                Logger.Debug("Reconnected to the socket");
+                EmitTrigger(eventReconnected);
             })
             .On(SocketService.EventDisconnected, delegate (string Event, Dictionary<string, string> Data)
             {
-                Logger.Debug("Disconnected from the socket", Data["description"]);
+                EmitTrigger(eventDisconnected);
             })
             .On(SocketService.EventAuthError, delegate (string Event, Dictionary<string, string> Data)
             {
@@ -196,57 +449,59 @@ public class CPHInline
             })
             .On(SocketService.EventGoalUpdated, delegate (string Event, Dictionary<string, string> Data)
             {
-                ExportGoal(Data);
-                if (CPH.ActionExists(DefaultGoalHandlerActionName))
-                    CPH.RunAction(DefaultGoalHandlerActionName);
+                EmitTrigger(eventGoalUpdated, BuildGoalArguments(Data));
             })
             .On(SocketService.EventRecievedDonation, delegate (string Event, Dictionary<string, string> Data)
             {
-                ExportDonation(Data);
-                string targetActionName = string.Format("DonationHandler_{0}", Data["amount"]);
-                if (CPH.ActionExists(targetActionName))
-                    CPH.RunAction(targetActionName, false);
-                else if (CPH.ActionExists(DefaultHandlerActionName))
-                    CPH.RunAction(DefaultHandlerActionName);
-
-                if (CPH.ActionExists(DefaultAfterDonationHandlerActionName))
-                    CPH.RunAction(DefaultAfterDonationHandlerActionName);
+                Logger.Debug("Donation handler entered", "id=" + Data["id"]);
+                TriggerDonationEventBySum(Data["amount"], BuildDonationArguments(Data));
+            })
+            .On(SocketService.EventMediaAdd, delegate (string Event, Dictionary<string, string> Data)
+            {
+                var eventArgs = new Dictionary<string, object>();
+                foreach (var item in Data)
+                    eventArgs["da.media." + item.Key] = item.Value;
+                EmitTrigger(eventMediaAdd, eventArgs);
             });
-
-
-        SocketService.Start(accessToken);
-        return true;
     }
-    private void ExportDonation(Dictionary<string, string> Donation)
-    {
-        string username = "Anonymous";
-        if (!string.IsNullOrEmpty(Donation["username"]))
-            username = Donation["username"];
-        string type = Donation["type"];
 
-        CPH.SetArgument("daName", Donation["name"]);
-        CPH.SetArgument("daUsername", username);
-        CPH.SetArgument("daType", type);
+    private Dictionary<string, object> BuildDonationArguments(Dictionary<string, string> donation)
+    {
+        string username = string.IsNullOrEmpty(donation["username"]) ? "Anonymous" : donation["username"];
+        string type = donation["type"];
+
+        var eventArgs = new Dictionary<string, object>
+        {
+            { "daName", donation["name"] },
+            { "daUsername", username },
+            { "daType", type },
+            { "daAmount", donation["amount"] },
+            { "daCurrency", donation["currency"] },
+            { "daAmountConverted", donation["amount_in_user_currency"] },
+        };
+
         if (type == SocketService.DonationData.TypeText)
-            CPH.SetArgument("daMessage", Donation["content"]);
-        else if (type == SocketService.DonationData.TypeAudio) {
-            CPH.SetArgument("daAudioUrl", Donation["content"]);
-            CPH.SetArgument("daAudio", SaveFileToTemp(Donation["content"], Donation["id"] + ".wav"));
+            eventArgs["daMessage"] = donation["content"];
+        else if (type == SocketService.DonationData.TypeAudio)
+        {
+            eventArgs["daAudioUrl"] = donation["content"];
+            eventArgs["daAudio"] = SaveFileToTemp(donation["content"], donation["id"] + ".wav");
         }
-            
-        CPH.SetArgument("daAmount", Donation["amount"]);
-        CPH.SetArgument("daCurrency", Donation["currency"]);
-        CPH.SetArgument("daAmountConverted", Donation["amount_in_user_currency"]);
+
+        return eventArgs;
     }
 
-    private void ExportGoal(Dictionary<string, string> GoalData)
+    private Dictionary<string, object> BuildGoalArguments(Dictionary<string, string> goal)
     {
-        CPH.SetArgument("daGoalIsActive", GoalData["is_active"]);
-        CPH.SetArgument("daGoalIsDefault", GoalData["is_default"]);
-        CPH.SetArgument("daGoalTitle", GoalData["title"]);
-        CPH.SetArgument("daGoalCurrency", GoalData["currency"]);
-        CPH.SetArgument("daGoalCurrent", GoalData["current"]);
-        CPH.SetArgument("daGoalTarget", GoalData["target"]);
+        return new Dictionary<string, object>
+        {
+            { "daGoalIsActive", goal["is_active"] },
+            { "daGoalIsDefault", goal["is_default"] },
+            { "daGoalTitle", goal["title"] },
+            { "daGoalCurrency", goal["currency"] },
+            { "daGoalCurrent", goal["current"] },
+            { "daGoalTarget", goal["target"] },
+        };
     }
 
     private string SaveFileToTemp(string fileUrl, string name)
@@ -264,6 +519,10 @@ public class CPHInline
 public class SocketService
 {
     private const string SocketHost = "wss://centrifugo.donationalerts.com/connection/websocket";
+    private const string MediaSocketUrl = "wss://socket1.donationalerts.ru/socket.io/";
+    private const string PollingMediaSocketUrl = "https://socket1.donationalerts.ru/socket.io/";
+    private const string transportPolling = "polling";
+    private const string transportWebSocket = "websocket";
 
     public const string EventStarted      = "started";
     public const string EventConnected    = "connected";
@@ -275,13 +534,47 @@ public class SocketService
 
     public const string EventRecievedMessage  = "recieved_message";
     public const string EventRecievedDonation = "recieved_donation";
+    public const string EventMediaAdd = "media_add";
     public const string EventGoalUpdated      = "goal_updated";
     private EventObserver Observer { get; set; }
     private Service DaService { get; set; }
-    private ClientWebSocket Socket { get; set; }
     private CPHInline.PrefixedLogger Logger { get; set; }
+    private readonly object LifecycleLock = new object();
+    private CancellationTokenSource ActiveRun;
+    private CancellationTokenSource ActiveMediaRun;
+    // Task references are retained until the corresponding worker exits.
+    private Task DonationWorker;
+    private Task MediaWorker;
+    // v0.9.0 shutdown: retain active sockets so Close can abort them directly.
+    // Publish the force-close flag before touching either socket.
+    private volatile ClientWebSocket Socket;
+    private volatile ClientWebSocket MediaSocket;
+    private volatile bool IsForceClosed;
+    private readonly string InstanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+
+    public bool IsClosed { get { return IsForceClosed; } }
+
+    private bool ShouldStop(CancellationToken cancellation)
+    {
+        return IsForceClosed || cancellation.IsCancellationRequested;
+    }
+
+    private void ThrowIfStopping(CancellationToken cancellation)
+    {
+        if (IsForceClosed)
+            throw new OperationCanceledException("Watcher disposed", cancellation);
+        cancellation.ThrowIfCancellationRequested();
+    }
+
+    // Shutdown logging is best effort: the host logger may already be gone.
+    private void LogLifecycle(string message)
+    {
+        try { Logger.Debug(message, "instance=" + InstanceId); }
+        catch (Exception) { }
+    }
 
     private const int BufferSize = 3072;
+    private const int MaxSocketMessageSize = 4 * 1024 * 1024;
 
     private string PreviousGoalEventHash = "";
 
@@ -296,130 +589,407 @@ public class SocketService
         Observer.Subscribe(EventName, handler);
         return this;
     }
-    public Task Start(string AccessToken)
+    // A dedicated queue does not make a never-returning Action safe for
+    // host shutdown. Start a managed background task and return immediately.
+    public bool Start(string accessToken)
     {
-        return ConnectAndProccess(AccessToken);
+        return StartWatcher(accessToken, false);
     }
-    public void Close()
+
+    private bool StartWatcher(string token, bool isMedia)
     {
+        lock (LifecycleLock)
+        {
+            if (IsForceClosed)
+                return false;
+
+            if ((isMedia ? ActiveMediaRun : ActiveRun) != null)
+                return true;
+
+            var run = new CancellationTokenSource();
+            if (isMedia)
+                ActiveMediaRun = run;
+            else
+                ActiveRun = run;
+
+            try
+            {
+                // Do not pass run.Token to Task.Run: even if cancelled before
+                // scheduling, the delegate must run to release the lifecycle state.
+                Task worker = Task.Run(() => RunWatcher(token, isMedia, run));
+                if (isMedia)
+                    MediaWorker = worker;
+                else
+                    DonationWorker = worker;
+                return true;
+            }
+            catch
+            {
+                if (isMedia)
+                    ActiveMediaRun = null;
+                else
+                    ActiveRun = null;
+                run.Dispose();
+                return false;
+            }
+        }
+    }
+
+    private void RunWatcher(string token, bool isMedia, CancellationTokenSource run)
+    {
+        string name = isMedia ? "Media Watcher" : "Background Watcher";
         try
         {
-            if (Socket == null)
+            if (ShouldStop(run.Token))
                 return;
-            Socket.Abort();
-            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-            Socket = null;
-            Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", "manual" } });
-        }
-        catch (Exception) { }
 
-    }
-    private Task ConnectAndProccess(string AccessToken, bool isReconnected = false)
-    {
-        Service.ProfileInfoData userProfile = null;
-        try
-        {
-            userProfile = DaService.GetProfileInfo(AccessToken);
-        } catch (WebException e)
-        {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            if (statusCodeResponse == HttpStatusCode.Unauthorized)
+            LogLifecycle(name + " started (background task)");
+            if (isMedia)
+                RunMediaSocket(token, run.Token);
+            else
             {
-                Observer.Dispatch(EventAuthError);
-                throw e;
+                PreviousGoalEventHash = "";
+                RunConnections(token, run.Token);
             }
         }
-
-        Socket = new ClientWebSocket();
-        Observer.Dispatch(EventStarted, null);
-        Socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
-        Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
-
-        var buf = new ArraySegment<byte>(new byte[BufferSize]);
-
-        if (Socket.State == WebSocketState.Open)
+        catch (Exception e)
         {
-            string socketClientId = ObtainSocketClientId(userProfile.SocketConnectionToken);
-            var channelInfoList = DaService.ObtainChannelSubscribeToken(AccessToken, userProfile.Id, socketClientId);
-            foreach (var channelInfoItem in channelInfoList)
-            {
-                this.SubscribeToTheChannel(channelInfoItem.Channel, channelInfoItem.Token);
-            }
+            if (!ShouldStop(run.Token))
+                LogLifecycle(name + " failed: " + e.GetType().Name);
         }
-
-        try
+        finally
         {
-            while (Socket.State == WebSocketState.Open)
+            lock (LifecycleLock)
             {
-                Logger.Debug("Waiting for a message");
-                var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
-                if (result.MessageType == WebSocketMessageType.Close)
+                // The run remains active until all connection cleanup finishes.
+                if (isMedia)
                 {
-                    Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-                    Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
+                    ActiveMediaRun = null;
+                    MediaWorker = null;
                 }
                 else
                 {
-                    isReconnected = false;
-                    Logger.Debug("Recieved message");
-                    string rawMessage = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-                    Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
-                    Logger.Debug(rawMessage);
-                    var socketMessage = JsonConvert.DeserializeObject<Dictionary<string, SocketMessage>>(rawMessage)["result"];
-                    try
-                    {
-                        var messageType = socketMessage.RecognizeType();
-                        switch (messageType)
-                        {
-                            case SocketMessage.TypeDonation:
-                                var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationResponse>>(rawMessage);
-                                if (!donationEvent["result"].IsValid())
-                                    continue;
+                    ActiveRun = null;
+                    DonationWorker = null;
+                }
+                run.Dispose();
+            }
 
-                                var donation = donationEvent["result"].Data.Donation;
-                                Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
-                                break;
-                            case SocketMessage.TypeGoal:
-                                var goalEvent = JsonConvert.DeserializeObject<Dictionary<string, GoalProgressResponse>>(rawMessage);
-                                if (!goalEvent["result"].IsValid())
-                                    continue;
+            if (!IsForceClosed)
+                LogLifecycle(name + " stopped");
+        }
+    }
 
-                                var goal = goalEvent["result"].Data.GoalData;
-                                var goalHash = Helper.GetMD5Hash(goal);
+    // Manual stop permits a later start, but only after the old run exits.
+    public void Stop()
+    {
+        lock (LifecycleLock)
+        {
+            try { CancelRun(ActiveRun); }
+            finally { AbortSocket(Socket); }
+        }
+    }
 
-                                if (goalHash == PreviousGoalEventHash)
-                                {
-                                    Logger.Debug("Duplicated goal data arrived. Skipping");
-                                    continue;
-                                }
-                                    
-                                PreviousGoalEventHash = goalHash;
+    public void StopMedia()
+    {
+        lock (LifecycleLock)
+        {
+            try { CancelRun(ActiveMediaRun); }
+            finally { AbortSocket(MediaSocket); }
+        }
+    }
 
-                                Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
-                                break;
-                        }
-                        
-                    }
-                    catch (Exception) { }
+    private static void AbortSocket(ClientWebSocket socket)
+    {
+        if (socket == null)
+            return;
+
+        // Abort releases a pending connect/read/write. The watcher owns disposal.
+        // Do not attempt a graceful CloseAsync handshake on an aborted socket.
+        try { socket.Abort(); }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (WebSocketException) { }
+    }
+
+    private static void CancelRun(CancellationTokenSource run)
+    {
+        if (run == null)
+            return;
+
+        try { run.Cancel(); }
+        catch (ObjectDisposedException) { }
+        catch (AggregateException) { }
+    }
+
+    // Do not join the worker tasks, rely on a WebSocket cancellation callback,
+    // or call host APIs from Dispose. Direct abort releases pending socket I/O.
+    public void Close()
+    {
+        IsForceClosed = true;
+        try
+        {
+            AbortSocket(Socket);
+        }
+        finally
+        {
+            try
+            {
+                AbortSocket(MediaSocket);
+            }
+            finally
+            {
+                // Still cancel HTTP operations and interrupt reconnect delays.
+                // No WebSocket Abort callbacks are registered on these tokens.
+                lock (LifecycleLock)
+                {
+                    CancelRun(ActiveRun);
+                    CancelRun(ActiveMediaRun);
                 }
             }
         }
-        catch (Exception)
-        {
-            if (isReconnected)
-            {
-                Logger.Debug("Cannot reconnect to socket too many times");
-                return null;
-            }
-        }
-
-        return ConnectAndProccess(AccessToken, true);
     }
 
-    private string ObtainSocketClientId(string SocketToken)
+    private bool RunConnections(string accessToken, CancellationToken cancellation)
     {
-        if (Socket == null || Socket.State != WebSocketState.Open)
+        bool isReconnected = false;
+        int retryDelay = 1000;
+        while (!ShouldStop(cancellation))
+        {
+            bool receivedMessage = false;
+            try
+            {
+                RunConnection(accessToken, isReconnected, cancellation, ref receivedMessage);
+            }
+            catch (WebException e)
+            {
+                var response = e.Response as HttpWebResponse;
+                bool unauthorized = response != null && response.StatusCode == HttpStatusCode.Unauthorized;
+                if (e.Response != null)
+                    e.Response.Close();
+
+                if (ShouldStop(cancellation))
+                    return true;
+
+                if (unauthorized)
+                {
+                    Observer.Dispatch(EventAuthError);
+                    return false;
+                }
+
+                Logger.Error("WebSocket setup HTTP request failed", e.Status);
+            }
+            catch (Exception e)
+            {
+                // Cancellation can surface as OperationCanceledException,
+                // WebSocketException or ObjectDisposedException depending on the runtime.
+                if (ShouldStop(cancellation))
+                    return true;
+
+                Logger.Error("WebSocket connection failed", e.GetType().Name);
+            }
+
+            if (ShouldStop(cancellation))
+                return true;
+
+            // v0.9.0 kept retrying. Retain that behavior with a bounded
+            // backoff and no recursive calls or delay after cancellation.
+            isReconnected = true;
+            if (receivedMessage)
+                retryDelay = 1000;
+            if (ShouldStop(cancellation))
+                return true;
+
+            Logger.Debug("Waiting before donation socket reconnect", retryDelay);
+            if (cancellation.WaitHandle.WaitOne(retryDelay) || ShouldStop(cancellation))
+                return true;
+            retryDelay = Math.Min(retryDelay * 2, 30000);
+        }
+
+        return true;
+    }
+
+    private void RunConnection(string accessToken, bool isReconnected,
+        CancellationToken cancellation, ref bool receivedMessage)
+    {
+        ThrowIfStopping(cancellation);
+        var userProfile = DaService.GetProfileInfo(accessToken, cancellation);
+        if (userProfile == null || string.IsNullOrEmpty(userProfile.SocketConnectionToken))
+            throw new InvalidDataException("Missing socket profile");
+
+        ThrowIfStopping(cancellation);
+        using (var socket = new ClientWebSocket())
+        {
+            Socket = socket;
+            try
+            {
+                ThrowIfStopping(cancellation);
+                Observer.Dispatch(EventStarted, null);
+                socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
+                ThrowIfStopping(cancellation);
+                Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
+
+                string socketClientId = ObtainSocketClientId(socket, userProfile.SocketConnectionToken, cancellation);
+                var channelInfoList = DaService.ObtainChannelSubscribeToken(accessToken, userProfile.Id, socketClientId, cancellation);
+                foreach (var channelInfoItem in channelInfoList)
+                {
+                    ThrowIfStopping(cancellation);
+                    SubscribeToTheChannel(socket, channelInfoItem.Channel, channelInfoItem.Token, cancellation);
+                }
+
+                while (!ShouldStop(cancellation) && socket.State == WebSocketState.Open)
+                {
+                    Logger.Debug("Waiting for a message");
+                    WebSocketReceiveResult result;
+                    string rawMessage = ReceiveSocketMessage(socket, cancellation, out result);
+                    ThrowIfStopping(cancellation);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
+                        // Acknowledge the peer close, but never block shutdown on it.
+                        using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                        {
+                            closeTimeout.CancelAfter(2000);
+                            socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, closeTimeout.Token).GetAwaiter().GetResult();
+                        }
+                        return;
+                    }
+
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        receivedMessage = true;
+                        ProcessSocketMessage(rawMessage, cancellation);
+                    }
+                }
+            }
+            finally
+            {
+                Socket = null;
+            }
+        }
+    }
+
+    // ReceiveAsync returns a chunk, not necessarily a complete message.
+    // Decode UTF-8 only after assembling all chunks, including split multibyte characters.
+    private string ReceiveSocketMessage(ClientWebSocket socket, CancellationToken cancellation, out WebSocketReceiveResult result)
+    {
+        var buffer = new ArraySegment<byte>(new byte[BufferSize]);
+        using (var message = new MemoryStream())
+        {
+            int chunks = 0;
+            do
+            {
+                ThrowIfStopping(cancellation);
+                result = socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
+                ThrowIfStopping(cancellation);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return null;
+
+                chunks++;
+                if (message.Length + result.Count > MaxSocketMessageSize)
+                    throw new InvalidDataException("WebSocket message exceeds configured limit");
+
+                message.Write(buffer.Array, buffer.Offset, result.Count);
+            }
+            while (!result.EndOfMessage);
+
+            Logger.Debug("WebSocket message received", "bytes=" + message.Length,
+                "chunks=" + chunks, "type=" + result.MessageType);
+            if (result.MessageType != WebSocketMessageType.Text)
+                return null;
+
+            return Encoding.UTF8.GetString(message.ToArray());
+        }
+    }
+
+    private void ProcessSocketMessage(string rawMessage, CancellationToken cancellation)
+    {
+        string stage = "raw event";
+        try
+        {
+            if (ShouldStop(cancellation))
+                return;
+            Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
+
+            // Parse the envelope once. A malformed message must not disconnect the watcher.
+            stage = "JSON envelope";
+            var envelope = JObject.Parse(rawMessage);
+            var result = envelope["result"] as JObject;
+            if (result == null)
+            {
+                if (envelope["error"] != null)
+                    Logger.Error("WebSocket protocol error received");
+                return;
+            }
+
+            var socketMessage = result.ToObject<SocketMessage>();
+            var messageType = socketMessage.RecognizeType();
+            if (messageType == SocketMessage.TypeUnknown)
+                return;
+
+            // Join/leave confirmations have a channel but do not contain a publication.
+            var publication = result["data"] as JObject;
+            if (publication == null || !(publication["data"] is JObject))
+            {
+                Logger.Debug("WebSocket channel message has no publication", messageType);
+                return;
+            }
+
+            switch (messageType)
+            {
+                case SocketMessage.TypeDonation:
+                    stage = "donation deserialization";
+                    var donationEvent = result.ToObject<DonationResponse>();
+                    if (!donationEvent.IsValid())
+                    {
+                        Logger.Debug("Donation publication rejected: missing data or non-positive amount");
+                        return;
+                    }
+
+                    var donation = donationEvent.Data.Donation;
+                    Logger.Debug("Donation publication parsed", "id=" + donation.Id);
+                    stage = "donation dispatch";
+                    if (ShouldStop(cancellation))
+                        return;
+                    Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
+                    Logger.Debug("Donation dispatch completed", "id=" + donation.Id);
+                    break;
+
+                case SocketMessage.TypeGoal:
+                    stage = "goal deserialization";
+                    var goalEvent = result.ToObject<GoalProgressResponse>();
+                    if (!goalEvent.IsValid())
+                        return;
+
+                    var goal = goalEvent.Data.GoalData;
+                    var goalHash = Helper.GetMD5Hash(goal);
+                    if (goalHash == PreviousGoalEventHash)
+                    {
+                        Logger.Debug("Duplicated goal data arrived. Skipping");
+                        return;
+                    }
+
+                    stage = "goal dispatch";
+                    if (ShouldStop(cancellation))
+                        return;
+                    Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
+                    PreviousGoalEventHash = goalHash;
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            // Exception messages and raw JSON can contain sensitive data.
+            if (!ShouldStop(cancellation))
+                Logger.Error("WebSocket message processing failed", stage, e.GetType().Name);
+        }
+    }
+
+    private string ObtainSocketClientId(ClientWebSocket socket, string SocketToken, CancellationToken cancellation)
+    {
+        ThrowIfStopping(cancellation);
+        if (socket.State != WebSocketState.Open)
             throw new Exception("Socket is closed");
 
 
@@ -432,59 +1002,65 @@ public class SocketService
         };
         var payload = JsonConvert.SerializeObject(request);
 
-        Socket.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
+        socket.SendAsync(
+            new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
             CancellationToken.None
         ).GetAwaiter().GetResult();
 
-        var buffer = new ArraySegment<byte>(new byte[BufferSize]);
-        var result = Socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
-        Logger.Debug("Auth response resieved");
+        WebSocketReceiveResult result;
+        string authMessage = ReceiveSocketMessage(socket, cancellation, out result);
+        ThrowIfStopping(cancellation);
+        Logger.Debug("Auth response received");
         if (result.MessageType == WebSocketMessageType.Close)
         {
-            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
             Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
-            throw new Exception("Socket has closed connection");
+            throw new IOException("Socket closed during authentication");
         }
         Logger.Debug("Recieved auth message");
 
-        var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(Encoding.ASCII.GetString(buffer.Array, 0, result.Count));
+        if (authMessage == null)
+            throw new InvalidDataException("Expected a text WebSocket auth response");
+
+        var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(authMessage);
+        if (authResponse == null || authResponse.Data == null || string.IsNullOrEmpty(authResponse.Data.Client))
+            throw new InvalidDataException("WebSocket auth response has no client identifier");
  
         Observer.Dispatch(EventAuthorized, new Dictionary<string, string> { { "client", authResponse.Data.Client }, { "version", authResponse.Data.Version } });
 
         return authResponse.Data.Client;
     }
-    private void SubscribeToTheChannel(string Channel, string ChannelToken)
+    private void SubscribeToTheChannel(ClientWebSocket socket, string Channel, string ChannelToken, CancellationToken cancellation)
     {
+        ThrowIfStopping(cancellation);
         var request = new SubscribeRequest
         {
             Data = new SubscribeRequestData { Channel = Channel, Token = ChannelToken },
         };
         var payload = JsonConvert.SerializeObject(request);
-        Socket.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
+        socket.SendAsync(
+            new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
             CancellationToken.None
         ).GetAwaiter().GetResult();
         Logger.Debug("Subscribe request has been sent");
 
-        var buf = new ArraySegment<byte>(new byte[BufferSize]);
-
         for (int i = 0; i < 2; i++)
         {
-            var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+            WebSocketReceiveResult result;
+            string jsonResponse = ReceiveSocketMessage(socket, cancellation, out result);
+            ThrowIfStopping(cancellation);
             Logger.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                 Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
-                throw new Exception("Socket has closed connection");
+                throw new IOException("Socket closed during subscription");
             }
-            var jsonResponse = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-            Logger.Debug("Subscribe response", jsonResponse);
+            if (jsonResponse == null)
+                throw new InvalidDataException("Expected a text WebSocket subscribe response");
+
             var response = JsonConvert.DeserializeObject<SubscribeResponse>(jsonResponse);
             if (response.Id != 0)
                 continue;
@@ -495,6 +1071,241 @@ public class SocketService
 
         Logger.Debug("Subscribed to the channel", Channel);
         Observer.Dispatch(EventSubscribed, new Dictionary<string, string> { { "channel", Channel } });
+    }
+
+    // Media support restored from the release v0.9.0 source. Keep its
+    // Engine.IO 3 polling/upgrade protocol, with an independent cancellation token.
+    private string ApplyMediaParameters(string url, string transport, string sid = "", string t = "")
+    {
+        var queryString = HttpUtility.ParseQueryString(string.Empty);
+        queryString.Add("EIO", "3");
+        queryString.Add("transport", transport);
+        if (!string.IsNullOrEmpty(sid))
+            queryString.Add("sid", sid);
+        if (!string.IsNullOrEmpty(t))
+            queryString.Add("t", t);
+        return string.Format("{0}?{1}", url, queryString.ToString());
+    }
+
+    private string GenerateT()
+    {
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString()));
+    }
+
+    private string CleanUpMediaResponseString(string response)
+    {
+        return response.Trim(new char[] { '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', ':' });
+    }
+
+    private MediaSocketResponse GetMediaRules(HttpClient httpClient, string t, CancellationToken cancellation)
+    {
+        string url = ApplyMediaParameters(PollingMediaSocketUrl, transportPolling, t: t);
+        using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+        using (var response = httpClient.SendAsync(request, cancellation).GetAwaiter().GetResult())
+        {
+            response.EnsureSuccessStatusCode();
+            string rawJson = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            ThrowIfStopping(cancellation);
+            var result = JsonConvert.DeserializeObject<MediaSocketResponse>(CleanUpMediaResponseString(rawJson));
+            if (result == null || string.IsNullOrEmpty(result.sid))
+                throw new InvalidDataException("Media response has no session identifier");
+            Logger.Debug("Media rules fetched");
+            return result;
+        }
+    }
+
+    private void SendMediaPollingPacket(HttpClient httpClient, string sid, string t,
+        string packet, CancellationToken cancellation)
+    {
+        var url = ApplyMediaParameters(PollingMediaSocketUrl, transportPolling, sid, t);
+        // Engine.IO 3 polling frames are length-prefixed.
+        string payload = packet.Length.ToString(CultureInfo.InvariantCulture) + ":" + packet;
+        using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+        {
+            request.Content = new StringContent(payload, Encoding.UTF8);
+            request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("text/plain;charset=UTF-8");
+            using (var response = httpClient.SendAsync(request, cancellation).GetAwaiter().GetResult())
+            {
+                response.EnsureSuccessStatusCode();
+            }
+        }
+    }
+
+    private void RegisterMediaSocketUser(HttpClient httpClient, string token, string sid, string t,
+        CancellationToken cancellation)
+    {
+        string packet = "42" + JsonConvert.SerializeObject(new object[]
+        {
+            "add-user", new { token = token, type = "minor" }
+        });
+        SendMediaPollingPacket(httpClient, sid, t, packet, cancellation);
+        Logger.Debug("Media add-user emitted successfully");
+    }
+
+    private void SubscribeMediaMessages(HttpClient httpClient, string token, string sid, string t,
+        CancellationToken cancellation)
+    {
+        string packet = "42" + JsonConvert.SerializeObject(new object[]
+        {
+            "media", new { token = token, message_data = new { action = "get-pause-state", source = "media_widget" } }
+        });
+        SendMediaPollingPacket(httpClient, sid, t, packet, cancellation);
+        Logger.Debug("Media subscribe emitted successfully");
+    }
+
+    public bool StartMediaSocket(string mediaToken)
+    {
+        return StartWatcher(mediaToken, true);
+    }
+
+    private void SendMediaSocketPacket(ClientWebSocket socket, string packet, CancellationToken cancellation)
+    {
+        ThrowIfStopping(cancellation);
+        socket.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(packet)),
+            WebSocketMessageType.Text, true, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    private void RunMediaSocket(string mediaToken, CancellationToken cancellation)
+    {
+        using (var httpClient = new HttpClient())
+        {
+            string t = GenerateT();
+            var mediaData = GetMediaRules(httpClient, t, cancellation);
+            RegisterMediaSocketUser(httpClient, mediaToken, mediaData.sid, t, cancellation);
+            SubscribeMediaMessages(httpClient, mediaToken, mediaData.sid, t, cancellation);
+
+            string socketUrl = ApplyMediaParameters(MediaSocketUrl, transportWebSocket, mediaData.sid);
+            using (var mediaSocket = new ClientWebSocket())
+            {
+                MediaSocket = mediaSocket;
+                try
+                {
+                    ThrowIfStopping(cancellation);
+                    Observer.Dispatch(EventStarted, null);
+                    mediaSocket.ConnectAsync(new Uri(socketUrl), CancellationToken.None).GetAwaiter().GetResult();
+                    ThrowIfStopping(cancellation);
+                    if (mediaSocket.State != WebSocketState.Open)
+                        throw new IOException("Media socket did not open");
+
+                    Logger.Debug("Connected to the media socket");
+                    SendMediaSocketPacket(mediaSocket, "2probe", cancellation);
+                    SendMediaSocketPacket(mediaSocket, "5", cancellation);
+                    SendMediaSocketPacket(mediaSocket, "2", cancellation);
+                    Logger.Debug("Media initialization flow is done");
+
+                    while (!ShouldStop(cancellation) && mediaSocket.State == WebSocketState.Open)
+                    {
+                        WebSocketReceiveResult result;
+                        string message = ReceiveSocketMessage(mediaSocket, cancellation, out result);
+                        ThrowIfStopping(cancellation);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            Logger.Debug("Media socket connection is closed");
+                            using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                            {
+                                closeTimeout.CancelAfter(2000);
+                                mediaSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null,
+                                    closeTimeout.Token).GetAwaiter().GetResult();
+                            }
+                            return;
+                        }
+
+                        if (result.MessageType == WebSocketMessageType.Text)
+                            ProcessMediaMessage(message, cancellation);
+
+                        if (ShouldStop(cancellation) || mediaSocket.State != WebSocketState.Open)
+                            return;
+                        SendMediaSocketPacket(mediaSocket, "2", cancellation);
+                        if (cancellation.WaitHandle.WaitOne(2000) || ShouldStop(cancellation))
+                            return;
+                    }
+                }
+                finally
+                {
+                    MediaSocket = null;
+                }
+            }
+        }
+    }
+
+    private void ProcessMediaMessage(string message, CancellationToken cancellation)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(message) || ShouldStop(cancellation))
+                return;
+            string rawJson = CleanUpMediaResponseString(message);
+            // Ignore Engine.IO probe/pong and Socket.IO control packets.
+            if (!rawJson.StartsWith("[", StringComparison.Ordinal))
+                return;
+
+            var packet = JArray.Parse(rawJson);
+            if (packet.Count < 2 || packet[0].Type != JTokenType.String ||
+                (string)packet[0] != "media")
+                return;
+
+            var mediaMessage = packet[1].Type == JTokenType.String
+                ? JsonConvert.DeserializeObject<MediaSocketMessageMediaMessage>((string)packet[1])
+                : packet[1].ToObject<MediaSocketMessageMediaMessage>();
+            if (mediaMessage == null || mediaMessage.media == null ||
+                string.IsNullOrEmpty(mediaMessage.media.additional_data))
+                return;
+
+            var additionalData = JsonConvert.DeserializeObject<MediaAdditionalData>(mediaMessage.media.additional_data);
+            if (additionalData == null || ShouldStop(cancellation))
+                return;
+
+            Logger.Debug("Media request parsed");
+            Observer.Dispatch(EventMediaAdd, new Dictionary<string, string>
+            {
+                { "title", mediaMessage.media.title },
+                { "url", additionalData.url },
+                { "video_id", additionalData.video_id },
+                { "owner", additionalData.owner },
+            });
+        }
+        catch (Exception e)
+        {
+            if (!ShouldStop(cancellation))
+                Logger.Error("Media message processing failed", e.GetType().Name);
+        }
+    }
+
+    private class MediaSocketResponse
+    {
+        public List<string> upgrades;
+        public string sid;
+        public int pingInterval;
+        public int pingTimeout;
+    }
+
+    private class MediaSocketMessageMediaMessage
+    {
+        public string action;
+        public MediaSocketMessageMediaInfo media;
+    }
+
+    private class MediaSocketMessageMediaInfo
+    {
+        public int media_id;
+        public string user_id;
+        public string type;
+        public string sub_type;
+        public string title;
+        public string additional_data;
+        public string date_created;
+        public int is_played;
+        public object date_played;
+    }
+
+    private class MediaAdditionalData
+    {
+        public string video_id;
+        public int alert_id;
+        public int alert_type;
+        public string owner;
+        public string url;
+        public int start_from;
     }
 
     private class SocketClientRequest
@@ -567,11 +1378,11 @@ public class SocketService
         public string Channel { get; set; }
         public string RecognizeType()
         {
-            if (Channel.Contains("$alerts:donation"))
+            if (!string.IsNullOrEmpty(Channel) && Channel.StartsWith("$alerts:donation_", StringComparison.Ordinal))
             {
                 return TypeDonation;
             }
-            else if (Channel.Contains("$goals:goal"))
+            else if (!string.IsNullOrEmpty(Channel) && Channel.StartsWith("$goals:goal_", StringComparison.Ordinal))
             {
                 return TypeGoal;
             }
@@ -590,7 +1401,7 @@ public class SocketService
 
         public bool IsValid()
         {
-            return Data.Donation.Amount > 0;
+            return Data != null && Data.Donation != null && Data.Donation.Amount > 0;
         }
     }
     private class DonationResponseData
@@ -642,7 +1453,7 @@ public class SocketService
         public GoalProgressData Data = new GoalProgressData();
         public bool IsValid()
         {
-            return Data.GoalData.GoalAmount > 0;
+            return Data != null && Data.GoalData != null && Data.GoalData.GoalAmount > 0;
         }
     }
     private class GoalProgressData
@@ -712,6 +1523,7 @@ public class Service
     }
     public bool ServeAndListenAuth(HandleCode Handler)
     {
+        bool hasCode = false;
         try
         {
             Listener = new HttpListener();
@@ -727,9 +1539,18 @@ public class Service
                     HttpListenerResponse resp = context.Response;
                     var queryDictionary = HttpUtility.ParseQueryString(request.Url.Query);
                     string code = queryDictionary["code"];
-                    Handler(code);
+                    hasCode = !string.IsNullOrWhiteSpace(code) && string.IsNullOrEmpty(queryDictionary["error"]);
+                    if (hasCode)
+                        Handler(code);
+                    else
+                        Logger.Error("OAuth callback did not contain a successful authorization code");
 
-                    string pageData = "<!DOCTYPE html><html><head><title>Интеграция DonationAlerts + Streamer.bot</title><meta charset=\"UTF-8\"><link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha2/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-aFq/bzH65dt+w6FI2ooMVUpc+21e0SRygnTpmBvdBgSdnuTN7QbdgL+OapgHtvPp\" crossorigin=\"anonymous\"><style>body{background-color:#111}</style></head><body><div class=\"container text-center mt-5 text-white-50\"><h3>Успешно авторизован</h3><p>Вы можете закрыть эту вкладку</p><iframe src=\"https://player.twitch.tv/?channel=play_code&parent=127.0.0.1\" frameborder=\"0\" allowfullscreen=\"true\" scrolling=\"no\" height=\"378\" width=\"620\"></iframe><hr><p class=\"font-monospace\">Спасибо за использование интеграции!<br>Если вы столкнулись с любыми сложностями или хотите предложить улучшение функционала,<br>воспользуйтесь секцией <strong>Issues</strong> на <a href=\"https://github.com/play-code-live/streamer.bot-donationAlerts/issues/new\">GitHub</a><br>❤️</p></div></body></html>";
+                    string pageData = "<!DOCTYPE html><html><head><title>Интеграция DonationAlerts + Streamer.bot</title><meta charset=\"UTF-8\"><link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha2/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-aFq/bzH65dt+w6FI2ooMVUpc+21e0SRygnTpmBvdBgSdnuTN7QbdgL+OapgHtvPp\" crossorigin=\"anonymous\"><style>body{background-color:#111}</style></head><body><div class=\"container text-center mt-5 text-white-50\"><h3>Код авторизации получен</h3><p>Вы можете закрыть эту вкладку</p><iframe src=\"https://player.twitch.tv/?channel=play_code&parent=127.0.0.1\" frameborder=\"0\" allowfullscreen=\"true\" scrolling=\"no\" height=\"378\" width=\"620\"></iframe><hr><p class=\"font-monospace\">Спасибо за использование интеграции!<br>Если вы столкнулись с любыми сложностями или хотите предложить улучшение функционала,<br>воспользуйтесь секцией <strong>Issues</strong> на <a href=\"https://github.com/play-code-live/streamer.bot-donationAlerts/issues/new\">GitHub</a><br>❤️</p></div></body></html>";
+                    if (!hasCode)
+                    {
+                        resp.StatusCode = (int)HttpStatusCode.BadRequest;
+                        pageData = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body><h3>Авторизация не завершена</h3><p>Повторите подключение в Streamer.bot.</p></body></html>";
+                    }
                     byte[] data = Encoding.UTF8.GetBytes(pageData);
                     resp.ContentType = "text/html";
                     resp.ContentEncoding = Encoding.UTF8;
@@ -755,14 +1576,14 @@ public class Service
             return false;
         }
 
-        return true;
+        return hasCode;
     }
     public string GetAuthLink()
     {
         string url = Client.TargetHost + EndpointAuthorize;
-        return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), DefaultScope);
+        return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), HttpUtility.UrlEncode(DefaultScope, Encoding.UTF8));
     }
-    public ProfileInfoData GetProfileInfo(string accessToken)
+    public ProfileInfoData GetProfileInfo(string accessToken, CancellationToken cancellation = default(CancellationToken))
     {
         var headers = new Dictionary<string, string>
         {
@@ -771,20 +1592,27 @@ public class Service
 
         try
         {
-            string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers);
+            string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers, cancellation);
             ProfileInfoResponse profile = JsonConvert.DeserializeObject<ProfileInfoResponse>(json);
-            Logger.Debug("Retrieved user profile info", profile.Data.Id, json);
+            Logger.Debug("Retrieved user profile info", profile.Data.Id);
 
             return profile.Data;
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
-            throw e;
+            if (!cancellation.IsCancellationRequested)
+                Logger.WebError(e);
+            throw;
         }
     }
     public TokenResponse ObtainToken(string Code)
     {
+        if (string.IsNullOrWhiteSpace(Code))
+        {
+            Logger.Error("OAuth authorization_code: missing authorization code");
+            return null;
+        }
+
         var values = new Dictionary<string, string>
         {
             { "grant_type", "authorization_code" },
@@ -794,22 +1622,16 @@ public class Service
             { "redirect_uri", RedirectUrl }
         };
 
-        try
-        {
-            string json = Client.POST(EndpointToken, values);
-            Logger.Debug("Request to the token API has been performed");
-            TokenResponse tokenData = JsonConvert.DeserializeObject<TokenResponse>(json);
-
-            return tokenData;
-        }
-        catch (WebException e)
-        {
-            Logger.WebError(e);
-            return null;
-        }
+        return RequestToken(values);
     }
     public TokenResponse RefreshToken(string refreshToken)
     {
+        if (string.IsNullOrWhiteSpace(refreshToken))
+        {
+            Logger.Error("OAuth refresh_token: missing refresh token");
+            return null;
+        }
+
         var values = new Dictionary<string, string>
         {
             { "grant_type", "refresh_token" },
@@ -819,19 +1641,114 @@ public class Service
             { "scope", DefaultScope }
         };
 
+        return RequestToken(values, refreshToken);
+    }
+
+    private TokenResponse RequestToken(Dictionary<string, string> values, string previousRefreshToken = null)
+    {
+        string grantType = values["grant_type"];
         try
         {
-            string json = Client.POST(EndpointToken, values);
-            Logger.Debug("Request to the token API has been performed");
-            return JsonConvert.DeserializeObject<TokenResponse>(json);
+            string json = Client.POSTForm(EndpointToken, values);
+            var tokenData = JsonConvert.DeserializeObject<TokenResponse>(json);
+            if (tokenData == null || string.IsNullOrWhiteSpace(tokenData.AccessToken))
+            {
+                Logger.Error("OAuth " + grantType + ": missing access token in response");
+                return null;
+            }
+
+            // DonationAlerts may omit the new refresh token during refresh.
+            if (string.IsNullOrWhiteSpace(tokenData.RefreshToken))
+                tokenData.RefreshToken = previousRefreshToken;
+
+            if (string.IsNullOrWhiteSpace(tokenData.RefreshToken))
+            {
+                Logger.Error("OAuth " + grantType + ": missing refresh token in response");
+                return null;
+            }
+
+            Logger.Debug("OAuth " + grantType + ": token response received");
+            return tokenData;
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
+            LogTokenError(grantType, e);
+            return null;
+        }
+        catch (JsonException)
+        {
+            // JSON exceptions can contain parts of the response, including tokens.
+            Logger.Error("OAuth " + grantType + ": invalid JSON token response");
             return null;
         }
     }
-    public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
+
+    private void LogTokenError(string grantType, WebException e)
+    {
+        string operation = "OAuth " + grantType;
+        Logger.WebError(e, operation);
+
+        // Only log known OAuth error identifiers. Never log the raw body,
+        // error_description, request parameters, or exception message.
+        using (var response = e.Response as HttpWebResponse)
+        {
+            if (response == null)
+                return;
+
+            try
+            {
+                using (var stream = response.GetResponseStream())
+                {
+                    if (stream == null)
+                        return;
+
+                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        var buffer = new char[4097];
+                        int count = reader.ReadBlock(buffer, 0, buffer.Length);
+                        if (count == buffer.Length)
+                        {
+                            Logger.Debug(operation + ": error response exceeds diagnostic limit");
+                            return;
+                        }
+
+                        var error = JsonConvert.DeserializeObject<OAuthErrorResponse>(new string(buffer, 0, count));
+                        switch (error == null ? null : error.Error)
+                        {
+                            case "invalid_request":
+                            case "invalid_client":
+                            case "invalid_grant":
+                            case "unauthorized_client":
+                            case "unsupported_grant_type":
+                            case "invalid_scope":
+                            case "access_denied":
+                            case "server_error":
+                            case "temporarily_unavailable":
+                                Logger.Error(operation + ": " + error.Error);
+                                break;
+                            default:
+                                Logger.Debug(operation + ": no recognized OAuth error identifier");
+                                break;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Diagnostics are best-effort and must not mask the original failure.
+                Logger.Debug(operation + ": error response could not be parsed");
+            }
+        }
+    }
+
+    private class OAuthErrorResponse
+    {
+        [JsonProperty("error")]
+        public string Error { get; set; }
+    }
+
+    public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId,
+        CancellationToken cancellation = default(CancellationToken))
     {
         var request = new ChannelSubscribeRequest
         {
@@ -850,7 +1767,7 @@ public class Service
 
         try
         {
-            var response = Client.POST(EndpointSubscribe, payload, headers);
+            var response = Client.POST(EndpointSubscribe, payload, headers, cancellation);
             var channels = JsonConvert.DeserializeObject<Dictionary<string, List<ChannelSubscribeResponse>>>(response);
             if (channels["channels"].Count == 0)
                 throw new Exception("Cannot fetch channels and it's tokens");
@@ -859,8 +1776,9 @@ public class Service
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
-            throw e;
+            if (!cancellation.IsCancellationRequested)
+                Logger.WebError(e);
+            throw;
         }
     }
 
@@ -926,7 +1844,8 @@ public class Client
 {
     public const string TargetHost = "https://www.donationalerts.com";
 
-    public string GET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers)
+    public string GET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers,
+        CancellationToken cancellation = default(CancellationToken))
     {
         var queryParams = new List<string>();
         foreach (var parameter in parameters)
@@ -934,7 +1853,7 @@ public class Client
             queryParams.Add(string.Format("{0}={1}", parameter.Key, parameter.Value));
         }
         endpoint += "?" + String.Join("&", queryParams);
-        return this.Perform(WebRequestMethods.Http.Get, TargetHost + endpoint, new Dictionary<string, string>(), headers);
+        return this.Perform(WebRequestMethods.Http.Get, TargetHost + endpoint, string.Empty, headers, cancellation: cancellation);
     }
     public string GET(string endpoint, Dictionary<string, string> parameters)
     {
@@ -944,9 +1863,10 @@ public class Client
     {
         return this.GET(endpoint, new Dictionary<string, string>());
     }
-    public string POST(string endpoint, string payload, Dictionary<string, string> headers)
+    public string POST(string endpoint, string payload, Dictionary<string, string> headers,
+        CancellationToken cancellation = default(CancellationToken))
     {
-        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers);
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers, cancellation: cancellation);
     }
     public string POST(string endpoint, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
@@ -961,39 +1881,60 @@ public class Client
         return this.POST(endpoint, new Dictionary<string, string>());
     }
 
-    private string Perform(string method, string url, string jsonPayload, Dictionary<string, string> headers)
+    public string POSTForm(string endpoint, Dictionary<string, string> payload)
     {
+        var fields = new List<string>();
+        foreach (var parameter in payload)
+        {
+            fields.Add(HttpUtility.UrlEncode(parameter.Key, Encoding.UTF8) + "=" +
+                HttpUtility.UrlEncode(parameter.Value, Encoding.UTF8));
+        }
+
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint,
+            string.Join("&", fields), new Dictionary<string, string>(), "application/x-www-form-urlencoded");
+    }
+
+    private string Perform(string method, string url, string payload, Dictionary<string, string> headers,
+        string contentType = "application/json", CancellationToken cancellation = default(CancellationToken))
+    {
+        cancellation.ThrowIfCancellationRequested();
         HttpWebRequest webRequest = (HttpWebRequest)WebRequest.Create(url);
         webRequest.Method = method;
-        webRequest.ContentType = "application/json";
+        webRequest.ContentType = contentType;
 
         foreach (var header in headers)
         {
             webRequest.Headers.Set(header.Key, header.Value);
         }
 
-        if (jsonPayload != string.Empty)
+        // The watcher's cancellation also interrupts synchronous profile/subscription HTTP.
+        using (cancellation.Register(() =>
         {
-            byte[] requestBytes = Encoding.ASCII.GetBytes(jsonPayload);
-            webRequest.ContentLength = requestBytes.Length;
-            Stream requestStream = webRequest.GetRequestStream();
-            requestStream.Write(requestBytes, 0, requestBytes.Length);
-            requestStream.Close();
-        }
-
-
-        var response = (HttpWebResponse)webRequest.GetResponse();
-        string json = "";
-        using (Stream respStr = response.GetResponseStream())
+            try { webRequest.Abort(); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }))
         {
+            cancellation.ThrowIfCancellationRequested();
+            if (payload != string.Empty)
+            {
+                byte[] requestBytes = Encoding.UTF8.GetBytes(payload);
+                webRequest.ContentLength = requestBytes.Length;
+                using (Stream requestStream = webRequest.GetRequestStream())
+                {
+                    requestStream.Write(requestBytes, 0, requestBytes.Length);
+                }
+            }
+
+            using (var response = (HttpWebResponse)webRequest.GetResponse())
+            using (Stream respStr = response.GetResponseStream())
             using (StreamReader rdr = new StreamReader(respStr, Encoding.UTF8))
             {
-                json = rdr.ReadToEnd();
-                rdr.Close();
+                string body = rdr.ReadToEnd();
+                cancellation.ThrowIfCancellationRequested();
+                return body;
             }
         }
-
-        return json;
     }
     private string Perform(string method, string url, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
