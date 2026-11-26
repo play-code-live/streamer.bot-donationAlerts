@@ -333,23 +333,25 @@ public class CPHInline
         }
     }
 
-    private void EmitTrigger(string eventId)
+    private void EmitTrigger(string eventId, Dictionary<string, object> eventArgs = null)
     {
         if (SocketService == null || SocketService.IsClosed)
             return;
 
+        // Watchers outlive the Action that started them. Never read or write
+        // that Action's argument stack, or inherit its media token/other args.
         Logger.Debug("Emitting custom trigger", eventId);
-        CPH.TriggerCodeEvent(eventId, true);
+        CPH.TriggerCodeEvent(eventId, eventArgs ?? new Dictionary<string, object>());
         Logger.Debug("Custom trigger emitted", eventId);
     }
 
-    private void TriggerDonationEventBySum(string amountValue)
+    private void TriggerDonationEventBySum(string amountValue, Dictionary<string, object> eventArgs)
     {
         decimal amount;
         if (!decimal.TryParse(amountValue, out amount))
         {
             Logger.Error("Invalid donation amount for range matching");
-            EmitTrigger(eventDonationAny);
+            EmitTrigger(eventDonationAny, eventArgs);
             return;
         }
 
@@ -364,7 +366,7 @@ public class CPHInline
         {
             if (range.Value == -1 && amount == range.Key)
             {
-                EmitTrigger("da.donation." + RangeId(range));
+                EmitTrigger("da.donation." + RangeId(range), eventArgs);
                 return;
             }
             if (range.Value != -1 && amount >= range.Key && amount <= range.Value)
@@ -373,7 +375,7 @@ public class CPHInline
                 break;
         }
 
-        EmitTrigger(bestMatch.HasValue ? "da.donation." + RangeId(bestMatch.Value) : eventDonationAny);
+        EmitTrigger(bestMatch.HasValue ? "da.donation." + RangeId(bestMatch.Value) : eventDonationAny, eventArgs);
     }
 
     public bool MediaCheckerLoop()
@@ -386,7 +388,10 @@ public class CPHInline
             string.IsNullOrWhiteSpace(rawToken == null ? null : rawToken.ToString()))
             return false;
 
-        return SocketService.StartMediaSocket(rawToken.ToString());
+        bool started = SocketService.StartMediaSocket(rawToken.ToString());
+        if (started)
+            Logger.Debug("MediaCheckerLoop returned; watcher is managed separately");
+        return started;
     }
 
     public bool DonationCheckerLoop()
@@ -408,7 +413,10 @@ public class CPHInline
             return false;
         }
 
-        return SocketService.Start(accessToken);
+        bool started = SocketService.Start(accessToken);
+        if (started)
+            Logger.Debug("DonationCheckerLoop returned; watcher is managed separately");
+        return started;
     }
 
     // Register observers once; the donation and media watchers share this instance.
@@ -441,53 +449,59 @@ public class CPHInline
             })
             .On(SocketService.EventGoalUpdated, delegate (string Event, Dictionary<string, string> Data)
             {
-                ExportGoal(Data);
-                EmitTrigger(eventGoalUpdated);
+                EmitTrigger(eventGoalUpdated, BuildGoalArguments(Data));
             })
             .On(SocketService.EventRecievedDonation, delegate (string Event, Dictionary<string, string> Data)
             {
                 Logger.Debug("Donation handler entered", "id=" + Data["id"]);
-                ExportDonation(Data);
-                TriggerDonationEventBySum(Data["amount"]);
+                TriggerDonationEventBySum(Data["amount"], BuildDonationArguments(Data));
             })
             .On(SocketService.EventMediaAdd, delegate (string Event, Dictionary<string, string> Data)
             {
+                var eventArgs = new Dictionary<string, object>();
                 foreach (var item in Data)
-                    CPH.SetArgument("da.media." + item.Key, item.Value);
-                EmitTrigger(eventMediaAdd);
+                    eventArgs["da.media." + item.Key] = item.Value;
+                EmitTrigger(eventMediaAdd, eventArgs);
             });
     }
 
-    private void ExportDonation(Dictionary<string, string> Donation)
+    private Dictionary<string, object> BuildDonationArguments(Dictionary<string, string> donation)
     {
-        string username = "Anonymous";
-        if (!string.IsNullOrEmpty(Donation["username"]))
-            username = Donation["username"];
-        string type = Donation["type"];
+        string username = string.IsNullOrEmpty(donation["username"]) ? "Anonymous" : donation["username"];
+        string type = donation["type"];
 
-        CPH.SetArgument("daName", Donation["name"]);
-        CPH.SetArgument("daUsername", username);
-        CPH.SetArgument("daType", type);
+        var eventArgs = new Dictionary<string, object>
+        {
+            { "daName", donation["name"] },
+            { "daUsername", username },
+            { "daType", type },
+            { "daAmount", donation["amount"] },
+            { "daCurrency", donation["currency"] },
+            { "daAmountConverted", donation["amount_in_user_currency"] },
+        };
+
         if (type == SocketService.DonationData.TypeText)
-            CPH.SetArgument("daMessage", Donation["content"]);
-        else if (type == SocketService.DonationData.TypeAudio) {
-            CPH.SetArgument("daAudioUrl", Donation["content"]);
-            CPH.SetArgument("daAudio", SaveFileToTemp(Donation["content"], Donation["id"] + ".wav"));
+            eventArgs["daMessage"] = donation["content"];
+        else if (type == SocketService.DonationData.TypeAudio)
+        {
+            eventArgs["daAudioUrl"] = donation["content"];
+            eventArgs["daAudio"] = SaveFileToTemp(donation["content"], donation["id"] + ".wav");
         }
-            
-        CPH.SetArgument("daAmount", Donation["amount"]);
-        CPH.SetArgument("daCurrency", Donation["currency"]);
-        CPH.SetArgument("daAmountConverted", Donation["amount_in_user_currency"]);
+
+        return eventArgs;
     }
 
-    private void ExportGoal(Dictionary<string, string> GoalData)
+    private Dictionary<string, object> BuildGoalArguments(Dictionary<string, string> goal)
     {
-        CPH.SetArgument("daGoalIsActive", GoalData["is_active"]);
-        CPH.SetArgument("daGoalIsDefault", GoalData["is_default"]);
-        CPH.SetArgument("daGoalTitle", GoalData["title"]);
-        CPH.SetArgument("daGoalCurrency", GoalData["currency"]);
-        CPH.SetArgument("daGoalCurrent", GoalData["current"]);
-        CPH.SetArgument("daGoalTarget", GoalData["target"]);
+        return new Dictionary<string, object>
+        {
+            { "daGoalIsActive", goal["is_active"] },
+            { "daGoalIsDefault", goal["is_default"] },
+            { "daGoalTitle", goal["title"] },
+            { "daGoalCurrency", goal["currency"] },
+            { "daGoalCurrent", goal["current"] },
+            { "daGoalTarget", goal["target"] },
+        };
     }
 
     private string SaveFileToTemp(string fileUrl, string name)
@@ -528,6 +542,9 @@ public class SocketService
     private readonly object LifecycleLock = new object();
     private CancellationTokenSource ActiveRun;
     private CancellationTokenSource ActiveMediaRun;
+    // Task references are retained until the corresponding worker exits.
+    private Task DonationWorker;
+    private Task MediaWorker;
     // v0.9.0 shutdown: retain active sockets so Close can abort them directly.
     // Publish the force-close flag before touching either socket.
     private volatile ClientWebSocket Socket;
@@ -572,42 +589,94 @@ public class SocketService
         Observer.Subscribe(EventName, handler);
         return this;
     }
-    // Run in the invoking action's context: CPH.SetArgument and
-    // TriggerCodeEvent(useArgs: true) depend on that context.
+    // A dedicated queue does not make a never-returning Action safe for
+    // host shutdown. Start a managed background task and return immediately.
     public bool Start(string accessToken)
     {
-        CancellationTokenSource run;
+        return StartWatcher(accessToken, false);
+    }
+
+    private bool StartWatcher(string token, bool isMedia)
+    {
         lock (LifecycleLock)
         {
             if (IsForceClosed)
                 return false;
-            if (ActiveRun != null)
+
+            if ((isMedia ? ActiveMediaRun : ActiveRun) != null)
+                return true;
+
+            var run = new CancellationTokenSource();
+            if (isMedia)
+                ActiveMediaRun = run;
+            else
+                ActiveRun = run;
+
+            try
             {
-                Logger.Debug("Background Watcher is already running or stopping");
+                // Do not pass run.Token to Task.Run: even if cancelled before
+                // scheduling, the delegate must run to release the lifecycle state.
+                Task worker = Task.Run(() => RunWatcher(token, isMedia, run));
+                if (isMedia)
+                    MediaWorker = worker;
+                else
+                    DonationWorker = worker;
                 return true;
             }
-
-            run = new CancellationTokenSource();
-            ActiveRun = run;
+            catch
+            {
+                if (isMedia)
+                    ActiveMediaRun = null;
+                else
+                    ActiveRun = null;
+                run.Dispose();
+                return false;
+            }
         }
+    }
 
+    private void RunWatcher(string token, bool isMedia, CancellationTokenSource run)
+    {
+        string name = isMedia ? "Media Watcher" : "Background Watcher";
         try
         {
-            PreviousGoalEventHash = "";
             if (ShouldStop(run.Token))
-                return true;
-            LogLifecycle("Background Watcher started");
-            return RunConnections(accessToken, run.Token);
+                return;
+
+            LogLifecycle(name + " started (background task)");
+            if (isMedia)
+                RunMediaSocket(token, run.Token);
+            else
+            {
+                PreviousGoalEventHash = "";
+                RunConnections(token, run.Token);
+            }
+        }
+        catch (Exception e)
+        {
+            if (!ShouldStop(run.Token))
+                LogLifecycle(name + " failed: " + e.GetType().Name);
         }
         finally
         {
             lock (LifecycleLock)
             {
-                ActiveRun = null;
+                // The run remains active until all connection cleanup finishes.
+                if (isMedia)
+                {
+                    ActiveMediaRun = null;
+                    MediaWorker = null;
+                }
+                else
+                {
+                    ActiveRun = null;
+                    DonationWorker = null;
+                }
                 run.Dispose();
             }
+
             if (!IsForceClosed)
-                LogLifecycle("Background Watcher stopped");
+                LogLifecycle(name + " stopped");
         }
     }
 
@@ -653,8 +722,8 @@ public class SocketService
         catch (AggregateException) { }
     }
 
-    // Restore the direct shutdown path from v0.9.0. Do not rely on a
-    // WebSocket cancellation callback or call host APIs from Dispose.
+    // Do not join the worker tasks, rely on a WebSocket cancellation callback,
+    // or call host APIs from Dispose. Direct abort releases pending socket I/O.
     public void Close()
     {
         IsForceClosed = true;
@@ -1086,45 +1155,7 @@ public class SocketService
 
     public bool StartMediaSocket(string mediaToken)
     {
-        CancellationTokenSource run;
-        lock (LifecycleLock)
-        {
-            if (IsForceClosed)
-                return false;
-            if (ActiveMediaRun != null)
-            {
-                Logger.Debug("Media Watcher is already running or stopping");
-                return true;
-            }
-            run = new CancellationTokenSource();
-            ActiveMediaRun = run;
-        }
-
-        try
-        {
-            if (ShouldStop(run.Token))
-                return true;
-            LogLifecycle("Media Watcher started");
-            RunMediaSocket(mediaToken, run.Token);
-            return true;
-        }
-        catch (Exception e)
-        {
-            if (ShouldStop(run.Token))
-                return true;
-            Logger.Error("Media Watcher failed", e.GetType().Name);
-            return false;
-        }
-        finally
-        {
-            lock (LifecycleLock)
-            {
-                ActiveMediaRun = null;
-                run.Dispose();
-            }
-            if (!IsForceClosed)
-                LogLifecycle("Media Watcher stopped");
-        }
+        return StartWatcher(mediaToken, true);
     }
 
     private void SendMediaSocketPacket(ClientWebSocket socket, string packet, CancellationToken cancellation)

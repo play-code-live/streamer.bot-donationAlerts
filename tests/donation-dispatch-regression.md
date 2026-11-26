@@ -44,6 +44,8 @@ Replace the existing inline integration.cs in a disposable copy of the v0.9.0 St
 
 ## Regression scenarios
 
+- Confirm the starting Action has completed before a donation arrives: the trigger still receives its own argument dictionary, with no startup Action arguments or credentials. Test consecutive donations and concurrent goal/media events for argument isolation.
+
 - Restart with no active OAuth session or watcher: all six base triggers are present after Init, when precompile is enabled.
 - Start DonationCheckerLoop with daRanges="100-500,400,500-1000"; stop and restart Streamer.bot. Range triggers are restored from persisted da.donation.ranges during Init, before authorization or the watcher. Names and event IDs remain unchanged; existing actions still point to them.
 - Start watcher without daRanges: retain saved ranges. Start with an explicitly empty daRanges: clear routing configuration (previous menu entries can remain registered until restart). Invalid daRanges: warn and preserve saved configuration.

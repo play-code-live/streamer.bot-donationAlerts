@@ -47,7 +47,7 @@
 * `--DonationAlerts Code` - Содержит основной код интеграции, который вызывается посредством **Call C# Method** в Streamer.bot
 * `--DonationAlerts Authorization` - Основная логика авторизации в сервисе. Вызывается вводом команды `!da_connect`
 * `--DonationAlerts Enable Background Watcher` - Активирует действия `Init` и `Background Watcher` для работы интеграции и автоматического запуска.
-* `--DonationAlerts Background Watcher` - Фоновое действие, отслеживающее появление новых донатов. Всегда должно находиться в очереди. Для ручной постановки в очередь, введите команду `!da_start`
+* `--DonationAlerts Background Watcher` - Действие запуска фонового watcher. После запуска оно завершается, а WebSocket продолжает работать в отдельной задаче. Для ручного запуска введите команду `!da_start`. Существующую очередь можно сохранить.
 * `--DonationAlerts Autostart` - Обеспечивает безопасный запуск кода отслеживания донатов
 * `--DonationAlerts Init` - Автоматически запускает код отслеживания донатов на запуске streamer.bot
 
@@ -62,7 +62,7 @@
 * **DA: Goal Updated**: обновления целей сбора.
 * **Media → DA: Media Add**: MediaCheckerLoop получает `daMediaToken`; аргументы события — `da.media.title`, `da.media.url`, `da.media.video_id`, `da.media.owner`.
 
-Для ручной остановки доступны методы StopDonationCheckerLoop и StopMediaCheckerLoop. Вызывайте их из отдельной очереди, не заблокированной watcher.
+Для ручной остановки доступны методы StopDonationCheckerLoop и StopMediaCheckerLoop. Действие запуска не ожидает окончания watcher. События передаются через явные словари аргументов, без копирования аргументов стартового действия.
 
 ## Аргументы
 
