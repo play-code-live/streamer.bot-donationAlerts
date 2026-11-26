@@ -1,12 +1,23 @@
-# Donation dispatch regression — issue #9 follow-up
+# Donation and custom trigger regression — v0.9.0
 
-OAuth was reported working by the maintainer, but a donation publication was visible in the watcher log without a visible Action execution.
-
-The old code reads one ReceiveAsync result as a whole message, ignores EndOfMessage, uses ASCII, silently swallows dispatch exceptions, and discards RunAction's boolean return value. These are confirmed code defects. Whether any of them caused the reported live failure remains to be verified. The provided log appears to omit closing braces; the log rendering may differ from the wire payload.
+The maintainer supplied the actual v0.9.0 source. The previously tracked main and develop sources used legacy named Actions instead of the released custom triggers. The branch now restores the original trigger IDs, names, categories and arguments while retaining the OAuth, WebSocket assembly and cancellation fixes.
 
 ## Setup
 
-Replace the inline integration.cs in a disposable Streamer.bot configuration, compile and save, then restart the Background Watcher. Reuse the existing valid OAuth tokens. Add simple visible test sub-actions to the named handlers; check Action History as well as the watcher log. Never share OAuth tokens or raw socket messages.
+Replace the existing inline integration.cs in a disposable copy of the v0.9.0 Streamer.bot configuration. Save and compile. Check **Precompile on Application start** on the Execute C# Code sub-action that owns the integration. Use the existing actions/trigger bindings; do not re-import an older release. Existing valid OAuth credentials can be retained. For controlled network failures use only dummy credentials and loopback fixtures.
+
+## Trigger registration
+
+| Trigger label | Code event ID | Category below Custom |
+| --- | --- | --- |
+| DA: Connected | da.connection.connected | DonationAlerts / Connection |
+| DA: Disconnected | da.connection.disconnected | DonationAlerts / Connection |
+| DA: Reconnected | da.connection.reconnected | DonationAlerts / Connection |
+| DA: Any donation | da.donation.any | DonationAlerts / Donations |
+| DA: Goal Updated | da.goal.updated | DonationAlerts |
+| DA: Media Add | da.media.add | DonationAlerts / Media |
+| DA: Donation (400) | da.donation.400 | DonationAlerts / Donations |
+| DA: Donation (100-500) | da.donation.100-500 | DonationAlerts / Donations |
 
 ## Synthetic fixture
 
@@ -24,49 +35,32 @@ Replace the inline integration.cs in a disposable Streamer.bot configuration, co
         "message_type": "text",
         "amount": 400,
         "currency": "RUB",
-        "amount_in_user_currency": 400,
-        "is_shown": 0,
-        "reason": "default"
+        "amount_in_user_currency": 400
       }
     }
   }
 }
 ```
 
-This fixture uses invented IDs and text, but follows the reported payload structure.
+## Regression scenarios
 
-## Manual or loopback mock scenarios
+- Restart with no active OAuth session or watcher: all six base triggers are present after Init, when precompile is enabled.
+- Start DonationCheckerLoop with daRanges="100-500,400,500-1000"; stop and restart Streamer.bot. Range triggers are restored from persisted da.donation.ranges during Init, before authorization or the watcher. Names and event IDs remain unchanged; existing actions still point to them.
+- Start watcher without daRanges: retain saved ranges. Start with an explicitly empty daRanges: clear routing configuration (previous menu entries can remain registered until restart). Invalid daRanges: warn and preserve saved configuration.
+- Complete fixture in one message, then split over several receives, including a split UTF-8 character and a message larger than 3072 bytes: exactly one donation publication per message, intact args and correct trigger.
+- Test exact 400 with daRanges above: only da.donation.400. Test 250: only da.donation.100-500. Test 500: only da.donation.500-1000 (last matching sorted range). Test 50: only da.donation.any. Test 250.50: range match, not an integer conversion exception. Any is the historical fallback, not an additional event.
+- On a valid donation, args include daName, daUsername, daType, daMessage (text) or daAudioUrl and daAudio (audio), daAmount, daCurrency, daAmountConverted as before. Test text, anonymous, and audio separately.
+- Test goal changes and duplicate goals: da.goal.updated with the previous daGoal* argument contract, unchanged goals skipped.
+- Test malformed JSON followed by a valid publication, unknown/control messages, null data, zero amount: watcher continues and does not emit an invalid donation.
+- Stop/start and reconnect: one observer per event; no duplicate events from accumulating handlers.
+- Check logs: Custom trigger registered, Donation publication parsed, Donation handler entered, Emitting custom trigger, Custom trigger emitted. Emitting a trigger does not prove a bound Action ran; inspect Action History and trigger/action enabled state.
+- Media: v0.9.0 polling and WebSocket upgrade still work; media event produces da.media.add with da.media.title, da.media.url, da.media.video_id, da.media.owner. Verify both string and object Socket.IO payloads using synthetic messages. No media token/session ID/raw packet in changed logs.
+- Media without a daMediaToken argument returns false rather than throwing; it does not depend on starting the donation watcher first.
 
-| Scenario | Expected |
-| --- | --- |
-| Complete fixture in one text message | Publication parsed; donation handler entered; daAmount=400, daType=text, daCurrency=RUB, daMessage=Проверка; exactly one primary handler selected. |
-| Split the fixture over two or more WebSocket chunks, including a split inside a UTF-8 character | One complete message after EndOfMessage; intact text; one dispatch. |
-| Complete donation JSON larger than the 3072-byte receive buffer (under 4 MiB) | Message is assembled across reads; no truncation; one dispatch. |
-| Malformed complete JSON, then valid donation | Error at JSON envelope stage; watcher stays alive and processes the following valid donation. |
-| Channel join notification, empty control object or unknown channel | No donation action; watcher continues. |
-| Null data or zero amount | No donation action; no NullReferenceException. |
-| DonationHandler_400 exists | RunAction(name, false) is called and result logged; default not called. |
-| DonationHandler_400 absent; DonationHandler_Default exists | Default runs with the original immediate=true behavior. |
-| No matching or default handler | Log action not found; no silent failure. |
-| Action exists but RunAction returns false | Warning identifies action; no duplicate/fallback primary action. |
-| Export or dispatch throws | Processing stage and exception type logged, not raw exception text; subsequent event still processed. |
-| DonationHandler_After exists | Existing immediate execution semantics retained. |
-| Goal publication and duplicate goal publication | Goal dispatched once; duplicate skipped. |
-| Fragmented auth/subscription response | Same complete-message receive helper used; current handshake semantics retained. |
-| Binary/close message | Binary ignored in watcher; close follows existing reconnect behavior. |
-| Message exceeds 4 MiB | Receive loop reports error and follows existing reconnect path. |
+## References
 
-For a mock use only synthetic credentials/IDs and a disposable local configuration; never forward live OAuth traffic to a mock.
+- https://docs.streamer.bot/guide/core/triggers
+- https://docs.streamer.bot/api/csharp/methods/core/triggers/register-custom-trigger
+- https://docs.streamer.bot/api/triggers/custom/code-event
 
-## Expected logs on the happy path
-
-- WebSocket message received, bytes=..., chunks=..., type=Text
-- Donation publication parsed, id=123
-- Donation handler entered, id=123
-- Donation arguments exported
-- Donation action not found, DonationHandler_400 (only if absent)
-- Running donation action, DonationHandler_Default, immediate=True (if default selected)
-- Donation action accepted, DonationHandler_Default
-- Donation dispatch completed, id=123
-
-RunAction=true means Streamer.bot accepted the operation, not that every sub-action completed. If accepted but nothing happens, inspect Action History, queue and action enablement. The patch intentionally retains the prior specific/default/after execution modes and subscription handshake semantics.
+No Streamer.bot runtime or compiler test was performed here. These scenarios need to be run against the installed version. No release import files were rebuilt.

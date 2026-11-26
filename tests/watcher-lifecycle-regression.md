@@ -1,31 +1,27 @@
-# Background Watcher lifecycle regression
+# Donation and Media Watcher lifecycle regression
 
-The previous DonationCheckerLoop occupied the invoking Action indefinitely, and the socket loop could recursively reconnect even after Dispose() aborted the socket. Socket operations used CancellationToken.None. These defects are confirmed in code; the exact host shutdown ordering must be verified in Streamer.bot.
+Both DonationCheckerLoop and MediaCheckerLoop now have independent cancellation sources. Dispose permanently closes the inline instance and cancels both runs without joining the action threads. Network operations use cancellable socket connect/send/receive, profile/subscription requests, media polling, and cancellation-aware delays. Manual StopDonationCheckerLoop and StopMediaCheckerLoop stop the corresponding run only, allowing a later start after it exits. Observers are configured once at Init.
 
-The watcher remains synchronous in the invoking action context to preserve CPH.SetArgument and RunAction behavior. The method now returns when the active run is cancelled. Dispose permanently closes the instance; StopDonationCheckerLoop requests cancellation without disabling future starts. The cancellation token reaches connect/send/receive, reconnect delay, profile GET and subscription POST. Cancellation does not wait for the worker in Dispose. A fresh run is allowed only after the previous run exits. The host must actually call Dispose during shutdown; if it waits for the current action before doing so, the manual stop below is a workaround and an event-based architecture may be needed.
-
-References: https://docs.streamer.bot/api/csharp/guide/lifecycle-methods and https://docs.streamer.bot/api/csharp/methods/core/actions/run-action
+The watcher stays synchronous in the calling Action to preserve the v0.9.0 CPH.SetArgument / TriggerCodeEvent(useArgs: true) behavior. The donation reconnect path retries with capped exponential backoff (1–30 seconds), does not recurse, and stops on HTTP 401 or cancellation. Media retains the original one-connection behavior.
 
 ## Setup
 
-Update the inline integration.cs, compile and save, restart the watcher with existing valid tokens. If the previous version prevents recompilation or exit, fully stop the old Streamer.bot process first, after saving settings. Do not test with live streams.
-
-For manual stop: create an action in a **separate non-blocking queue**, add Execute C# Method pointing to the same named inline C# instance and choose StopDonationCheckerLoop. Optionally bind !da_stop. It must not wait behind the long-running watcher action. The existing release import files are unchanged.
+Replace inline integration.cs in a disposable copy of the v0.9.0 configuration. Compile/save; enable Precompile on Application start. Existing valid tokens may be reused. For manual stop use a separate non-blocking action queue and Execute C# Method on the same inline instance; invoke StopDonationCheckerLoop or StopMediaCheckerLoop. An action queued behind the running watcher cannot stop it.
 
 ## Checks
 
-- Start watcher, wait for Waiting for a message, close Streamer.bot normally. Expect the old action to exit, no new connection attempt, and the application to close. Check elapsed time and whether Background Watcher stopped is logged when logging is still available.
-- Call StopDonationCheckerLoop while the watcher is waiting for a message. The active action completes; no reconnect.
-- Run !da_start again after stop; one connection, one execution per test donation. Repeat stop/start.
-- Invoke !da_start concurrently; at most one watcher per compiled inline instance; duplicate call returns without adding handlers.
-- Stop during connect, socket auth, subscription send/receive, profile GET, or channel-token POST using a synthetic loopback test setup with only dummy credentials. Expect cancellation, no fresh attempt, and no stuck network wait.
-- Drop the network without manual stop. Expect a bounded 1-second reconnect delay and at most one failed retry without receiving another text message; a working reconnection resumes delivery.
-- Stop during reconnect delay; no subsequent connection.
-- Force a profile or subscription HTTP 401; expect auth error notification and no endless retries.
-- Peer sends WebSocket Close; close output is bounded, then reconnect if not cancelled.
-- Recompile while idle; Dispose cancels the old instance; restart only one watcher.
-- Send donations before and after reconnect and manual restart; verify args and primary/default/after behavior is unchanged.
+- Start DonationCheckerLoop, wait for Waiting for a message, close Streamer.bot normally; no fresh connection after cancellation, action exits.
+- Start MediaCheckerLoop alone, close Streamer.bot normally; polling or receive is interrupted and Media Watcher stopped is logged if logging is still available.
+- Start both watchers; Dispose cancels both, regardless of startup order. No reconnect after disposal.
+- Stop only donation; media remains active. Stop only media; donation remains active. Restart after stop, one run of each, no accumulating observers. Try duplicate concurrent starts; no additional connection per watcher.
+- Stop during donation connect, auth, subscribe, profile GET or token POST; stop during media polling/upgrade/connect/receive/delay. Use synthetic credentials and local test setup.
+- Drop donation connection, verify backoff 1–30 seconds, recovery on network return, no tight recursion; cancel during backoff and verify no next attempt.
+- Verify 401 results in auth-error notification and no endless retry.
+- Verify peer close uses bounded close-output and unexpected donation disconnect reconnects. Check original da.connection.* events, donation/goal/media trigger args, saved range routing and no duplicate observers.
+- Recompile with active watchers. Old instance is disposed; new instance restores triggers in Init and only restarts watcher through normal actions.
 
 ## Known boundary
 
-The watcher cannot forcibly interrupt user-defined inline donation actions already executing, synchronous audio-file downloads, or a host API call blocked inside Streamer.bot. Do not join the action thread in Dispose. If the host waits for the running action before invoking Dispose, stop via the separate action and collect shutdown logs; a future migration to a detached task with explicit custom event arguments would require changing the installed Action configuration. No runtime/compile verification in Streamer.bot has been performed here.
+Host ordering must be verified: if Streamer.bot waits for a running action before calling Dispose, use manual stop on a separate queue. Cancellation cannot forcibly interrupt arbitrary host API calls or synchronous audio downloads already in progress. No runtime/compile verification or media protocol live test was performed here. Release import files are unchanged.
+
+Lifecycle reference: https://docs.streamer.bot/api/csharp/guide/lifecycle-methods
