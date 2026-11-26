@@ -528,20 +528,23 @@ public class SocketService
     private readonly object LifecycleLock = new object();
     private CancellationTokenSource ActiveRun;
     private CancellationTokenSource ActiveMediaRun;
-    // Permanent shutdown, visible from the watcher and the Dispose thread.
-    private volatile bool IsDisposed;
+    // v0.9.0 shutdown: retain active sockets so Close can abort them directly.
+    // Publish the force-close flag before touching either socket.
+    private volatile ClientWebSocket Socket;
+    private volatile ClientWebSocket MediaSocket;
+    private volatile bool IsForceClosed;
     private readonly string InstanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
-    public bool IsClosed { get { return IsDisposed; } }
+    public bool IsClosed { get { return IsForceClosed; } }
 
     private bool ShouldStop(CancellationToken cancellation)
     {
-        return IsDisposed || cancellation.IsCancellationRequested;
+        return IsForceClosed || cancellation.IsCancellationRequested;
     }
 
     private void ThrowIfStopping(CancellationToken cancellation)
     {
-        if (IsDisposed)
+        if (IsForceClosed)
             throw new OperationCanceledException("Watcher disposed", cancellation);
         cancellation.ThrowIfCancellationRequested();
     }
@@ -576,7 +579,7 @@ public class SocketService
         CancellationTokenSource run;
         lock (LifecycleLock)
         {
-            if (IsDisposed)
+            if (IsForceClosed)
                 return false;
             if (ActiveRun != null)
             {
@@ -603,7 +606,8 @@ public class SocketService
                 ActiveRun = null;
                 run.Dispose();
             }
-            LogLifecycle("Background Watcher stopped");
+            if (!IsForceClosed)
+                LogLifecycle("Background Watcher stopped");
         }
     }
 
@@ -612,8 +616,8 @@ public class SocketService
     {
         lock (LifecycleLock)
         {
-            if (ActiveRun != null)
-                ActiveRun.Cancel();
+            try { CancelRun(ActiveRun); }
+            finally { AbortSocket(Socket); }
         }
     }
 
@@ -621,38 +625,59 @@ public class SocketService
     {
         lock (LifecycleLock)
         {
-            if (ActiveMediaRun != null)
-                ActiveMediaRun.Cancel();
+            try { CancelRun(ActiveMediaRun); }
+            finally { AbortSocket(MediaSocket); }
         }
     }
 
-    // Permanent stop for this inline instance (Dispose/recompile/shutdown).
+    private static void AbortSocket(ClientWebSocket socket)
+    {
+        if (socket == null)
+            return;
+
+        // Abort releases a pending connect/read/write. The watcher owns disposal.
+        // Do not attempt a graceful CloseAsync handshake on an aborted socket.
+        try { socket.Abort(); }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (WebSocketException) { }
+    }
+
+    private static void CancelRun(CancellationTokenSource run)
+    {
+        if (run == null)
+            return;
+
+        try { run.Cancel(); }
+        catch (ObjectDisposedException) { }
+        catch (AggregateException) { }
+    }
+
+    // Restore the direct shutdown path from v0.9.0. Do not rely on a
+    // WebSocket cancellation callback or call host APIs from Dispose.
     public void Close()
     {
-        // Publish the flag immediately, before taking the lock or cancelling I/O.
-        // The existing Action loops must exit, not reconnect, during disposal.
-        IsDisposed = true;
-        LogLifecycle("Dispose entered: shutdown flag set");
-
+        IsForceClosed = true;
         try
         {
-            lock (LifecycleLock)
-            {
-                try
-                {
-                    if (ActiveRun != null)
-                        ActiveRun.Cancel();
-                }
-                finally
-                {
-                    if (ActiveMediaRun != null)
-                        ActiveMediaRun.Cancel();
-                }
-            }
+            AbortSocket(Socket);
         }
         finally
         {
-            LogLifecycle("Dispose finished: cancellation callbacks returned or failed");
+            try
+            {
+                AbortSocket(MediaSocket);
+            }
+            finally
+            {
+                // Still cancel HTTP operations and interrupt reconnect delays.
+                // No WebSocket Abort callbacks are registered on these tokens.
+                lock (LifecycleLock)
+                {
+                    CancelRun(ActiveRun);
+                    CancelRun(ActiveMediaRun);
+                }
+            }
         }
     }
 
@@ -725,53 +750,53 @@ public class SocketService
 
         ThrowIfStopping(cancellation);
         using (var socket = new ClientWebSocket())
-        using (cancellation.Register(() =>
         {
-            // Abort also unblocks a pending read on runtimes where cancellation
-            // alone is not sufficient. The connection owner disposes the socket.
-            try { socket.Abort(); }
-            catch (ObjectDisposedException) { }
-            catch (InvalidOperationException) { }
-        }))
-        {
-            ThrowIfStopping(cancellation);
-            Observer.Dispatch(EventStarted, null);
-            socket.ConnectAsync(new Uri(SocketHost), cancellation).GetAwaiter().GetResult();
-            ThrowIfStopping(cancellation);
-            Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
-
-            string socketClientId = ObtainSocketClientId(socket, userProfile.SocketConnectionToken, cancellation);
-            var channelInfoList = DaService.ObtainChannelSubscribeToken(accessToken, userProfile.Id, socketClientId, cancellation);
-            foreach (var channelInfoItem in channelInfoList)
+            Socket = socket;
+            try
             {
                 ThrowIfStopping(cancellation);
-                SubscribeToTheChannel(socket, channelInfoItem.Channel, channelInfoItem.Token, cancellation);
-            }
-
-            while (!ShouldStop(cancellation) && socket.State == WebSocketState.Open)
-            {
-                Logger.Debug("Waiting for a message");
-                WebSocketReceiveResult result;
-                string rawMessage = ReceiveSocketMessage(socket, cancellation, out result);
+                Observer.Dispatch(EventStarted, null);
+                socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
                 ThrowIfStopping(cancellation);
+                Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
 
-                if (result.MessageType == WebSocketMessageType.Close)
+                string socketClientId = ObtainSocketClientId(socket, userProfile.SocketConnectionToken, cancellation);
+                var channelInfoList = DaService.ObtainChannelSubscribeToken(accessToken, userProfile.Id, socketClientId, cancellation);
+                foreach (var channelInfoItem in channelInfoList)
                 {
-                    Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
-                    // Acknowledge the peer close, but never block shutdown on it.
-                    using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                    ThrowIfStopping(cancellation);
+                    SubscribeToTheChannel(socket, channelInfoItem.Channel, channelInfoItem.Token, cancellation);
+                }
+
+                while (!ShouldStop(cancellation) && socket.State == WebSocketState.Open)
+                {
+                    Logger.Debug("Waiting for a message");
+                    WebSocketReceiveResult result;
+                    string rawMessage = ReceiveSocketMessage(socket, cancellation, out result);
+                    ThrowIfStopping(cancellation);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        closeTimeout.CancelAfter(2000);
-                        socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, closeTimeout.Token).GetAwaiter().GetResult();
+                        Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
+                        // Acknowledge the peer close, but never block shutdown on it.
+                        using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                        {
+                            closeTimeout.CancelAfter(2000);
+                            socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, closeTimeout.Token).GetAwaiter().GetResult();
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    receivedMessage = true;
-                    ProcessSocketMessage(rawMessage, cancellation);
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        receivedMessage = true;
+                        ProcessSocketMessage(rawMessage, cancellation);
+                    }
                 }
+            }
+            finally
+            {
+                Socket = null;
             }
         }
     }
@@ -787,7 +812,7 @@ public class SocketService
             do
             {
                 ThrowIfStopping(cancellation);
-                result = socket.ReceiveAsync(buffer, cancellation).GetAwaiter().GetResult();
+                result = socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
                 ThrowIfStopping(cancellation);
                 if (result.MessageType == WebSocketMessageType.Close)
                     return null;
@@ -912,7 +937,7 @@ public class SocketService
             new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
-            cancellation
+            CancellationToken.None
         ).GetAwaiter().GetResult();
 
         WebSocketReceiveResult result;
@@ -949,7 +974,7 @@ public class SocketService
             new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
-            cancellation
+            CancellationToken.None
         ).GetAwaiter().GetResult();
         Logger.Debug("Subscribe request has been sent");
 
@@ -1064,7 +1089,7 @@ public class SocketService
         CancellationTokenSource run;
         lock (LifecycleLock)
         {
-            if (IsDisposed)
+            if (IsForceClosed)
                 return false;
             if (ActiveMediaRun != null)
             {
@@ -1097,7 +1122,8 @@ public class SocketService
                 ActiveMediaRun = null;
                 run.Dispose();
             }
-            LogLifecycle("Media Watcher stopped");
+            if (!IsForceClosed)
+                LogLifecycle("Media Watcher stopped");
         }
     }
 
@@ -1105,7 +1131,7 @@ public class SocketService
     {
         ThrowIfStopping(cancellation);
         socket.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(packet)),
-            WebSocketMessageType.Text, true, cancellation).GetAwaiter().GetResult();
+            WebSocketMessageType.Text, true, CancellationToken.None).GetAwaiter().GetResult();
     }
 
     private void RunMediaSocket(string mediaToken, CancellationToken cancellation)
@@ -1119,51 +1145,53 @@ public class SocketService
 
             string socketUrl = ApplyMediaParameters(MediaSocketUrl, transportWebSocket, mediaData.sid);
             using (var mediaSocket = new ClientWebSocket())
-            using (cancellation.Register(() =>
             {
-                try { mediaSocket.Abort(); }
-                catch (ObjectDisposedException) { }
-                catch (InvalidOperationException) { }
-            }))
-            {
-                ThrowIfStopping(cancellation);
-                Observer.Dispatch(EventStarted, null);
-                mediaSocket.ConnectAsync(new Uri(socketUrl), cancellation).GetAwaiter().GetResult();
-                ThrowIfStopping(cancellation);
-                if (mediaSocket.State != WebSocketState.Open)
-                    throw new IOException("Media socket did not open");
-
-                Logger.Debug("Connected to the media socket");
-                SendMediaSocketPacket(mediaSocket, "2probe", cancellation);
-                SendMediaSocketPacket(mediaSocket, "5", cancellation);
-                SendMediaSocketPacket(mediaSocket, "2", cancellation);
-                Logger.Debug("Media initialization flow is done");
-
-                while (!ShouldStop(cancellation) && mediaSocket.State == WebSocketState.Open)
+                MediaSocket = mediaSocket;
+                try
                 {
-                    WebSocketReceiveResult result;
-                    string message = ReceiveSocketMessage(mediaSocket, cancellation, out result);
                     ThrowIfStopping(cancellation);
-                    if (result.MessageType == WebSocketMessageType.Close)
-                    {
-                        Logger.Debug("Media socket connection is closed");
-                        using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
-                        {
-                            closeTimeout.CancelAfter(2000);
-                            mediaSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null,
-                                closeTimeout.Token).GetAwaiter().GetResult();
-                        }
-                        return;
-                    }
+                    Observer.Dispatch(EventStarted, null);
+                    mediaSocket.ConnectAsync(new Uri(socketUrl), CancellationToken.None).GetAwaiter().GetResult();
+                    ThrowIfStopping(cancellation);
+                    if (mediaSocket.State != WebSocketState.Open)
+                        throw new IOException("Media socket did not open");
 
-                    if (result.MessageType == WebSocketMessageType.Text)
-                        ProcessMediaMessage(message, cancellation);
-
-                    if (ShouldStop(cancellation) || mediaSocket.State != WebSocketState.Open)
-                        return;
+                    Logger.Debug("Connected to the media socket");
+                    SendMediaSocketPacket(mediaSocket, "2probe", cancellation);
+                    SendMediaSocketPacket(mediaSocket, "5", cancellation);
                     SendMediaSocketPacket(mediaSocket, "2", cancellation);
-                    if (cancellation.WaitHandle.WaitOne(2000) || ShouldStop(cancellation))
-                        return;
+                    Logger.Debug("Media initialization flow is done");
+
+                    while (!ShouldStop(cancellation) && mediaSocket.State == WebSocketState.Open)
+                    {
+                        WebSocketReceiveResult result;
+                        string message = ReceiveSocketMessage(mediaSocket, cancellation, out result);
+                        ThrowIfStopping(cancellation);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            Logger.Debug("Media socket connection is closed");
+                            using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                            {
+                                closeTimeout.CancelAfter(2000);
+                                mediaSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null,
+                                    closeTimeout.Token).GetAwaiter().GetResult();
+                            }
+                            return;
+                        }
+
+                        if (result.MessageType == WebSocketMessageType.Text)
+                            ProcessMediaMessage(message, cancellation);
+
+                        if (ShouldStop(cancellation) || mediaSocket.State != WebSocketState.Open)
+                            return;
+                        SendMediaSocketPacket(mediaSocket, "2", cancellation);
+                        if (cancellation.WaitHandle.WaitOne(2000) || ShouldStop(cancellation))
+                            return;
+                    }
+                }
+                finally
+                {
+                    MediaSocket = null;
                 }
             }
         }

@@ -1,6 +1,6 @@
 # Donation and Media Watcher lifecycle regression
 
-Both DonationCheckerLoop and MediaCheckerLoop now have independent cancellation sources. Dispose sets a volatile shutdown flag before taking the lifecycle lock or cancelling I/O, and cancels both runs without joining the action threads. The flag is checked before connection/reconnection, around receive, during dispatch, and before/after retry delays. Cancellation is still required to unblock a pending network read. Network operations use cancellable socket connect/send/receive, profile/subscription requests, media polling, and cancellation-aware delays. Manual StopDonationCheckerLoop and StopMediaCheckerLoop stop the corresponding run only, allowing a later start after it exits. Observers are configured once at Init.
+Both DonationCheckerLoop and MediaCheckerLoop keep independent cancellation sources for HTTP and reconnect delays. Following the maintainer's working v0.9.0 source, each active ClientWebSocket is published in a field. Dispose sets the volatile IsForceClosed flag, calls Abort directly on both sockets (without taking the lifecycle lock first), and then cancels the HTTP/delay tokens. Connect/send/receive use CancellationToken.None as in v0.9.0; aborting the actual socket interrupts them. The connection owner disposes its socket and clears the field in finally. The flag is checked around every operation and before reconnect. Do not issue CloseAsync on a socket already aborted or call Streamer.bot APIs from Dispose. Manual stop cancels and aborts the corresponding run only.
 
 The watcher stays synchronous in the calling Action on its dedicated queue to preserve the v0.9.0 CPH.SetArgument / TriggerCodeEvent(useArgs: true) behavior. The donation reconnect path retries with capped exponential backoff (1–30 seconds), does not recurse, and stops on HTTP 401 or cancellation. Media retains the original one-connection behavior.
 
@@ -22,13 +22,11 @@ Replace inline integration.cs in a disposable copy of the v0.9.0 configuration. 
 
 ## Shutdown diagnostics
 
-The start, stop and Dispose log lines carry an anonymous instance ID so we can distinguish old/new inline instances. The relative order of the stop and Dispose-finished messages is not guaranteed. Do not share raw event payloads or credentials.
-
-- Start the donation watcher and record its `Background Watcher started, instance=...` line.
-- Close Streamer.bot while the watcher is waiting for an event. Look for `Dispose entered: shutdown flag set` with the same instance ID, `Dispose finished: cancellation callbacks returned or failed`, and `Background Watcher stopped`. No new reconnect attempt should start after the shutdown flag is observed.
-- If no Dispose-entered line exists (and logging is still active), the host may be waiting for the long-running Action before calling Dispose, or disposing another instance. Check shutdown logs and compare instance IDs. A dedicated queue does not establish shutdown ordering.
-- If Dispose-entered is present but Dispose-finished is missing, examine cancellation callbacks / the lifecycle lock. If both are present but the watcher-stopped line is absent, check which blocking operation the watcher was in.
-- Call StopDonationCheckerLoop from a different queue, confirm the long-running Action ends, and close the application. This isolates the shutdown problem from the event dispatch path.
+- Confirm the currently tested v0.9.0 baseline closes normally (maintainer confirmed).
+- Compile this branch, start the donation watcher and close while it is waiting for a WebSocket message. Expect the active socket to abort and the loop to exit without reconnect. Repeat on both watchers together and during reconnect delay.
+- Stop manually from a separate queue; the watcher should log its normal stopped line and be restartable. Force-closed watchers deliberately avoid CPH lifecycle logging during host disposal so absence of a final log entry is expected.
+- If closing still hangs, inspect Streamer.bot shutdown logs or attach a debugger to see whether CPHInline.Dispose and SocketService.Close are reached, and whether the worker is inside a network operation, host API or queue wait. Do not rely solely on host logging from Dispose.
+- Confirm the same custom trigger IDs and arguments still work after restart. OAuth, trigger registration, and message parsing have not been changed.
 
 ## Known boundary
 
