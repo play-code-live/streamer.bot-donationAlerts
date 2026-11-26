@@ -28,12 +28,16 @@ public class CPHInline
         {
             this._CPH = _CPH;
         }
-        public void WebError(WebException e)
+        public void WebError(WebException e, string operation = "HTTP request")
         {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            int statusCodeResponseAsInt = ((int)response.StatusCode);
-            Error("WebException with status code " + statusCodeResponseAsInt.ToString(), statusCodeResponse);
+            var response = e.Response as HttpWebResponse;
+            if (response == null)
+            {
+                Error(operation + " failed", e.Status);
+                return;
+            }
+
+            Error(operation + " failed", e.Status, (int)response.StatusCode, response.StatusCode);
         }
         public void Error(string message)
         {
@@ -88,6 +92,8 @@ public class CPHInline
     }
     public bool CreateAuthLink()
     {
+        // Never reuse a code from an earlier authorization attempt.
+        CPH.SetGlobalVar("daCode", "", true);
         string authLink = Service.GetAuthLink();
         CPH.SendMessage(TextPleaseConnect);
         System.Diagnostics.Process.Start(authLink);
@@ -96,19 +102,21 @@ public class CPHInline
         return Service.ServeAndListenAuth(delegate (string code)
         {
             CPH.SetGlobalVar("daCode", code, true);
-            Logger.Debug("code : " + code);
+            Logger.Debug("Authorization code received");
             return code;
         });
     }
     public bool ObtainAccessToken()
     {
         string code = CPH.GetGlobalVar<string>("daCode");
-        if (code == "")
+        if (string.IsNullOrWhiteSpace(code))
         {
             Logger.Debug("Code argument has not arrivied. Make sure you initialized connection for the DA");
             return false;
         }
 
+        // Authorization codes are single-use. A failed exchange needs a new code.
+        CPH.SetGlobalVar("daCode", "", true);
         var tokenData = Service.ObtainToken(code);
         if (tokenData == null)
             return false;
@@ -127,7 +135,7 @@ public class CPHInline
         Logger.Debug("Refreshing access token");
 
         string refreshToken = CPH.GetGlobalVar<string>("daRefreshToken");
-        if (refreshToken == "")
+        if (string.IsNullOrWhiteSpace(refreshToken))
         {
             Logger.Debug("RefreshToken argument has not arrived. Make sure you initialized connection for the DA");
             return false;
@@ -712,6 +720,7 @@ public class Service
     }
     public bool ServeAndListenAuth(HandleCode Handler)
     {
+        bool hasCode = false;
         try
         {
             Listener = new HttpListener();
@@ -727,9 +736,18 @@ public class Service
                     HttpListenerResponse resp = context.Response;
                     var queryDictionary = HttpUtility.ParseQueryString(request.Url.Query);
                     string code = queryDictionary["code"];
-                    Handler(code);
+                    hasCode = !string.IsNullOrWhiteSpace(code) && string.IsNullOrEmpty(queryDictionary["error"]);
+                    if (hasCode)
+                        Handler(code);
+                    else
+                        Logger.Error("OAuth callback did not contain a successful authorization code");
 
-                    string pageData = "<!DOCTYPE html><html><head><title>Интеграция DonationAlerts + Streamer.bot</title><meta charset=\"UTF-8\"><link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha2/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-aFq/bzH65dt+w6FI2ooMVUpc+21e0SRygnTpmBvdBgSdnuTN7QbdgL+OapgHtvPp\" crossorigin=\"anonymous\"><style>body{background-color:#111}</style></head><body><div class=\"container text-center mt-5 text-white-50\"><h3>Успешно авторизован</h3><p>Вы можете закрыть эту вкладку</p><iframe src=\"https://player.twitch.tv/?channel=play_code&parent=127.0.0.1\" frameborder=\"0\" allowfullscreen=\"true\" scrolling=\"no\" height=\"378\" width=\"620\"></iframe><hr><p class=\"font-monospace\">Спасибо за использование интеграции!<br>Если вы столкнулись с любыми сложностями или хотите предложить улучшение функционала,<br>воспользуйтесь секцией <strong>Issues</strong> на <a href=\"https://github.com/play-code-live/streamer.bot-donationAlerts/issues/new\">GitHub</a><br>❤️</p></div></body></html>";
+                    string pageData = "<!DOCTYPE html><html><head><title>Интеграция DonationAlerts + Streamer.bot</title><meta charset=\"UTF-8\"><link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha2/dist/css/bootstrap.min.css\" rel=\"stylesheet\" integrity=\"sha384-aFq/bzH65dt+w6FI2ooMVUpc+21e0SRygnTpmBvdBgSdnuTN7QbdgL+OapgHtvPp\" crossorigin=\"anonymous\"><style>body{background-color:#111}</style></head><body><div class=\"container text-center mt-5 text-white-50\"><h3>Код авторизации получен</h3><p>Вы можете закрыть эту вкладку</p><iframe src=\"https://player.twitch.tv/?channel=play_code&parent=127.0.0.1\" frameborder=\"0\" allowfullscreen=\"true\" scrolling=\"no\" height=\"378\" width=\"620\"></iframe><hr><p class=\"font-monospace\">Спасибо за использование интеграции!<br>Если вы столкнулись с любыми сложностями или хотите предложить улучшение функционала,<br>воспользуйтесь секцией <strong>Issues</strong> на <a href=\"https://github.com/play-code-live/streamer.bot-donationAlerts/issues/new\">GitHub</a><br>❤️</p></div></body></html>";
+                    if (!hasCode)
+                    {
+                        resp.StatusCode = (int)HttpStatusCode.BadRequest;
+                        pageData = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body><h3>Авторизация не завершена</h3><p>Повторите подключение в Streamer.bot.</p></body></html>";
+                    }
                     byte[] data = Encoding.UTF8.GetBytes(pageData);
                     resp.ContentType = "text/html";
                     resp.ContentEncoding = Encoding.UTF8;
@@ -755,12 +773,12 @@ public class Service
             return false;
         }
 
-        return true;
+        return hasCode;
     }
     public string GetAuthLink()
     {
         string url = Client.TargetHost + EndpointAuthorize;
-        return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), DefaultScope);
+        return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), HttpUtility.UrlEncode(DefaultScope, Encoding.UTF8));
     }
     public ProfileInfoData GetProfileInfo(string accessToken)
     {
@@ -773,7 +791,7 @@ public class Service
         {
             string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers);
             ProfileInfoResponse profile = JsonConvert.DeserializeObject<ProfileInfoResponse>(json);
-            Logger.Debug("Retrieved user profile info", profile.Data.Id, json);
+            Logger.Debug("Retrieved user profile info", profile.Data.Id);
 
             return profile.Data;
         }
@@ -785,6 +803,12 @@ public class Service
     }
     public TokenResponse ObtainToken(string Code)
     {
+        if (string.IsNullOrWhiteSpace(Code))
+        {
+            Logger.Error("OAuth authorization_code: missing authorization code");
+            return null;
+        }
+
         var values = new Dictionary<string, string>
         {
             { "grant_type", "authorization_code" },
@@ -794,22 +818,16 @@ public class Service
             { "redirect_uri", RedirectUrl }
         };
 
-        try
-        {
-            string json = Client.POST(EndpointToken, values);
-            Logger.Debug("Request to the token API has been performed");
-            TokenResponse tokenData = JsonConvert.DeserializeObject<TokenResponse>(json);
-
-            return tokenData;
-        }
-        catch (WebException e)
-        {
-            Logger.WebError(e);
-            return null;
-        }
+        return RequestToken(values);
     }
     public TokenResponse RefreshToken(string refreshToken)
     {
+        if (string.IsNullOrWhiteSpace(refreshToken))
+        {
+            Logger.Error("OAuth refresh_token: missing refresh token");
+            return null;
+        }
+
         var values = new Dictionary<string, string>
         {
             { "grant_type", "refresh_token" },
@@ -819,18 +837,112 @@ public class Service
             { "scope", DefaultScope }
         };
 
+        return RequestToken(values, refreshToken);
+    }
+
+    private TokenResponse RequestToken(Dictionary<string, string> values, string previousRefreshToken = null)
+    {
+        string grantType = values["grant_type"];
         try
         {
-            string json = Client.POST(EndpointToken, values);
-            Logger.Debug("Request to the token API has been performed");
-            return JsonConvert.DeserializeObject<TokenResponse>(json);
+            string json = Client.POSTForm(EndpointToken, values);
+            var tokenData = JsonConvert.DeserializeObject<TokenResponse>(json);
+            if (tokenData == null || string.IsNullOrWhiteSpace(tokenData.AccessToken))
+            {
+                Logger.Error("OAuth " + grantType + ": missing access token in response");
+                return null;
+            }
+
+            // DonationAlerts may omit the new refresh token during refresh.
+            if (string.IsNullOrWhiteSpace(tokenData.RefreshToken))
+                tokenData.RefreshToken = previousRefreshToken;
+
+            if (string.IsNullOrWhiteSpace(tokenData.RefreshToken))
+            {
+                Logger.Error("OAuth " + grantType + ": missing refresh token in response");
+                return null;
+            }
+
+            Logger.Debug("OAuth " + grantType + ": token response received");
+            return tokenData;
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
+            LogTokenError(grantType, e);
+            return null;
+        }
+        catch (JsonException)
+        {
+            // JSON exceptions can contain parts of the response, including tokens.
+            Logger.Error("OAuth " + grantType + ": invalid JSON token response");
             return null;
         }
     }
+
+    private void LogTokenError(string grantType, WebException e)
+    {
+        string operation = "OAuth " + grantType;
+        Logger.WebError(e, operation);
+
+        // Only log known OAuth error identifiers. Never log the raw body,
+        // error_description, request parameters, or exception message.
+        using (var response = e.Response as HttpWebResponse)
+        {
+            if (response == null)
+                return;
+
+            try
+            {
+                using (var stream = response.GetResponseStream())
+                {
+                    if (stream == null)
+                        return;
+
+                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        var buffer = new char[4097];
+                        int count = reader.ReadBlock(buffer, 0, buffer.Length);
+                        if (count == buffer.Length)
+                        {
+                            Logger.Debug(operation + ": error response exceeds diagnostic limit");
+                            return;
+                        }
+
+                        var error = JsonConvert.DeserializeObject<OAuthErrorResponse>(new string(buffer, 0, count));
+                        switch (error == null ? null : error.Error)
+                        {
+                            case "invalid_request":
+                            case "invalid_client":
+                            case "invalid_grant":
+                            case "unauthorized_client":
+                            case "unsupported_grant_type":
+                            case "invalid_scope":
+                            case "access_denied":
+                            case "server_error":
+                            case "temporarily_unavailable":
+                                Logger.Error(operation + ": " + error.Error);
+                                break;
+                            default:
+                                Logger.Debug(operation + ": no recognized OAuth error identifier");
+                                break;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Diagnostics are best-effort and must not mask the original failure.
+                Logger.Debug(operation + ": error response could not be parsed");
+            }
+        }
+    }
+
+    private class OAuthErrorResponse
+    {
+        [JsonProperty("error")]
+        public string Error { get; set; }
+    }
+
     public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
     {
         var request = new ChannelSubscribeRequest
@@ -961,39 +1073,47 @@ public class Client
         return this.POST(endpoint, new Dictionary<string, string>());
     }
 
-    private string Perform(string method, string url, string jsonPayload, Dictionary<string, string> headers)
+    public string POSTForm(string endpoint, Dictionary<string, string> payload)
+    {
+        var fields = new List<string>();
+        foreach (var parameter in payload)
+        {
+            fields.Add(HttpUtility.UrlEncode(parameter.Key, Encoding.UTF8) + "=" +
+                HttpUtility.UrlEncode(parameter.Value, Encoding.UTF8));
+        }
+
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint,
+            string.Join("&", fields), new Dictionary<string, string>(), "application/x-www-form-urlencoded");
+    }
+
+    private string Perform(string method, string url, string payload, Dictionary<string, string> headers,
+        string contentType = "application/json")
     {
         HttpWebRequest webRequest = (HttpWebRequest)WebRequest.Create(url);
         webRequest.Method = method;
-        webRequest.ContentType = "application/json";
+        webRequest.ContentType = contentType;
 
         foreach (var header in headers)
         {
             webRequest.Headers.Set(header.Key, header.Value);
         }
 
-        if (jsonPayload != string.Empty)
+        if (payload != string.Empty)
         {
-            byte[] requestBytes = Encoding.ASCII.GetBytes(jsonPayload);
+            byte[] requestBytes = Encoding.UTF8.GetBytes(payload);
             webRequest.ContentLength = requestBytes.Length;
-            Stream requestStream = webRequest.GetRequestStream();
-            requestStream.Write(requestBytes, 0, requestBytes.Length);
-            requestStream.Close();
-        }
-
-
-        var response = (HttpWebResponse)webRequest.GetResponse();
-        string json = "";
-        using (Stream respStr = response.GetResponseStream())
-        {
-            using (StreamReader rdr = new StreamReader(respStr, Encoding.UTF8))
+            using (Stream requestStream = webRequest.GetRequestStream())
             {
-                json = rdr.ReadToEnd();
-                rdr.Close();
+                requestStream.Write(requestBytes, 0, requestBytes.Length);
             }
         }
 
-        return json;
+        using (var response = (HttpWebResponse)webRequest.GetResponse())
+        using (Stream respStr = response.GetResponseStream())
+        using (StreamReader rdr = new StreamReader(respStr, Encoding.UTF8))
+        {
+            return rdr.ReadToEnd();
+        }
     }
     private string Perform(string method, string url, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
