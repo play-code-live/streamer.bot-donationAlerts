@@ -335,6 +335,9 @@ public class CPHInline
 
     private void EmitTrigger(string eventId)
     {
+        if (SocketService == null || SocketService.IsClosed)
+            return;
+
         Logger.Debug("Emitting custom trigger", eventId);
         CPH.TriggerCodeEvent(eventId, true);
         Logger.Debug("Custom trigger emitted", eventId);
@@ -375,6 +378,9 @@ public class CPHInline
 
     public bool MediaCheckerLoop()
     {
+        if (SocketService == null || SocketService.IsClosed)
+            return false;
+
         object rawToken;
         if (!args.TryGetValue("daMediaToken", out rawToken) ||
             string.IsNullOrWhiteSpace(rawToken == null ? null : rawToken.ToString()))
@@ -385,6 +391,9 @@ public class CPHInline
 
     public bool DonationCheckerLoop()
     {
+        if (SocketService == null || SocketService.IsClosed)
+            return false;
+
         // Only overwrite the persisted configuration when the caller supplied daRanges.
         // An explicit empty value still means no amount-specific triggers.
         object rawRanges;
@@ -519,7 +528,30 @@ public class SocketService
     private readonly object LifecycleLock = new object();
     private CancellationTokenSource ActiveRun;
     private CancellationTokenSource ActiveMediaRun;
-    private bool IsDisposed;
+    // Permanent shutdown, visible from the watcher and the Dispose thread.
+    private volatile bool IsDisposed;
+    private readonly string InstanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+
+    public bool IsClosed { get { return IsDisposed; } }
+
+    private bool ShouldStop(CancellationToken cancellation)
+    {
+        return IsDisposed || cancellation.IsCancellationRequested;
+    }
+
+    private void ThrowIfStopping(CancellationToken cancellation)
+    {
+        if (IsDisposed)
+            throw new OperationCanceledException("Watcher disposed", cancellation);
+        cancellation.ThrowIfCancellationRequested();
+    }
+
+    // Shutdown logging is best effort: the host logger may already be gone.
+    private void LogLifecycle(string message)
+    {
+        try { Logger.Debug(message, "instance=" + InstanceId); }
+        catch (Exception) { }
+    }
 
     private const int BufferSize = 3072;
     private const int MaxSocketMessageSize = 4 * 1024 * 1024;
@@ -559,7 +591,9 @@ public class SocketService
         try
         {
             PreviousGoalEventHash = "";
-            Logger.Debug("Background Watcher started");
+            if (ShouldStop(run.Token))
+                return true;
+            LogLifecycle("Background Watcher started");
             return RunConnections(accessToken, run.Token);
         }
         finally
@@ -569,7 +603,7 @@ public class SocketService
                 ActiveRun = null;
                 run.Dispose();
             }
-            Logger.Debug("Background Watcher stopped");
+            LogLifecycle("Background Watcher stopped");
         }
     }
 
@@ -595,19 +629,30 @@ public class SocketService
     // Permanent stop for this inline instance (Dispose/recompile/shutdown).
     public void Close()
     {
-        lock (LifecycleLock)
+        // Publish the flag immediately, before taking the lock or cancelling I/O.
+        // The existing Action loops must exit, not reconnect, during disposal.
+        IsDisposed = true;
+        LogLifecycle("Dispose entered: shutdown flag set");
+
+        try
         {
-            IsDisposed = true;
-            try
+            lock (LifecycleLock)
             {
-                if (ActiveRun != null)
-                    ActiveRun.Cancel();
+                try
+                {
+                    if (ActiveRun != null)
+                        ActiveRun.Cancel();
+                }
+                finally
+                {
+                    if (ActiveMediaRun != null)
+                        ActiveMediaRun.Cancel();
+                }
             }
-            finally
-            {
-                if (ActiveMediaRun != null)
-                    ActiveMediaRun.Cancel();
-            }
+        }
+        finally
+        {
+            LogLifecycle("Dispose finished: cancellation callbacks returned or failed");
         }
     }
 
@@ -615,7 +660,7 @@ public class SocketService
     {
         bool isReconnected = false;
         int retryDelay = 1000;
-        while (!cancellation.IsCancellationRequested)
+        while (!ShouldStop(cancellation))
         {
             bool receivedMessage = false;
             try
@@ -624,13 +669,13 @@ public class SocketService
             }
             catch (WebException e)
             {
-                if (cancellation.IsCancellationRequested)
-                    return true;
-
                 var response = e.Response as HttpWebResponse;
                 bool unauthorized = response != null && response.StatusCode == HttpStatusCode.Unauthorized;
                 if (e.Response != null)
                     e.Response.Close();
+
+                if (ShouldStop(cancellation))
+                    return true;
 
                 if (unauthorized)
                 {
@@ -644,13 +689,13 @@ public class SocketService
             {
                 // Cancellation can surface as OperationCanceledException,
                 // WebSocketException or ObjectDisposedException depending on the runtime.
-                if (cancellation.IsCancellationRequested)
+                if (ShouldStop(cancellation))
                     return true;
 
                 Logger.Error("WebSocket connection failed", e.GetType().Name);
             }
 
-            if (cancellation.IsCancellationRequested)
+            if (ShouldStop(cancellation))
                 return true;
 
             // v0.9.0 kept retrying. Retain that behavior with a bounded
@@ -658,8 +703,11 @@ public class SocketService
             isReconnected = true;
             if (receivedMessage)
                 retryDelay = 1000;
+            if (ShouldStop(cancellation))
+                return true;
+
             Logger.Debug("Waiting before donation socket reconnect", retryDelay);
-            if (cancellation.WaitHandle.WaitOne(retryDelay))
+            if (cancellation.WaitHandle.WaitOne(retryDelay) || ShouldStop(cancellation))
                 return true;
             retryDelay = Math.Min(retryDelay * 2, 30000);
         }
@@ -670,12 +718,12 @@ public class SocketService
     private void RunConnection(string accessToken, bool isReconnected,
         CancellationToken cancellation, ref bool receivedMessage)
     {
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         var userProfile = DaService.GetProfileInfo(accessToken, cancellation);
         if (userProfile == null || string.IsNullOrEmpty(userProfile.SocketConnectionToken))
             throw new InvalidDataException("Missing socket profile");
 
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         using (var socket = new ClientWebSocket())
         using (cancellation.Register(() =>
         {
@@ -686,26 +734,26 @@ public class SocketService
             catch (InvalidOperationException) { }
         }))
         {
-            cancellation.ThrowIfCancellationRequested();
+            ThrowIfStopping(cancellation);
             Observer.Dispatch(EventStarted, null);
             socket.ConnectAsync(new Uri(SocketHost), cancellation).GetAwaiter().GetResult();
-            cancellation.ThrowIfCancellationRequested();
+            ThrowIfStopping(cancellation);
             Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
 
             string socketClientId = ObtainSocketClientId(socket, userProfile.SocketConnectionToken, cancellation);
             var channelInfoList = DaService.ObtainChannelSubscribeToken(accessToken, userProfile.Id, socketClientId, cancellation);
             foreach (var channelInfoItem in channelInfoList)
             {
-                cancellation.ThrowIfCancellationRequested();
+                ThrowIfStopping(cancellation);
                 SubscribeToTheChannel(socket, channelInfoItem.Channel, channelInfoItem.Token, cancellation);
             }
 
-            while (!cancellation.IsCancellationRequested && socket.State == WebSocketState.Open)
+            while (!ShouldStop(cancellation) && socket.State == WebSocketState.Open)
             {
                 Logger.Debug("Waiting for a message");
                 WebSocketReceiveResult result;
                 string rawMessage = ReceiveSocketMessage(socket, cancellation, out result);
-                cancellation.ThrowIfCancellationRequested();
+                ThrowIfStopping(cancellation);
 
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
@@ -738,8 +786,9 @@ public class SocketService
             int chunks = 0;
             do
             {
-                cancellation.ThrowIfCancellationRequested();
+                ThrowIfStopping(cancellation);
                 result = socket.ReceiveAsync(buffer, cancellation).GetAwaiter().GetResult();
+                ThrowIfStopping(cancellation);
                 if (result.MessageType == WebSocketMessageType.Close)
                     return null;
 
@@ -765,7 +814,7 @@ public class SocketService
         string stage = "raw event";
         try
         {
-            if (cancellation.IsCancellationRequested)
+            if (ShouldStop(cancellation))
                 return;
             Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
 
@@ -807,7 +856,7 @@ public class SocketService
                     var donation = donationEvent.Data.Donation;
                     Logger.Debug("Donation publication parsed", "id=" + donation.Id);
                     stage = "donation dispatch";
-                    if (cancellation.IsCancellationRequested)
+                    if (ShouldStop(cancellation))
                         return;
                     Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
                     Logger.Debug("Donation dispatch completed", "id=" + donation.Id);
@@ -828,7 +877,7 @@ public class SocketService
                     }
 
                     stage = "goal dispatch";
-                    if (cancellation.IsCancellationRequested)
+                    if (ShouldStop(cancellation))
                         return;
                     Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
                     PreviousGoalEventHash = goalHash;
@@ -838,13 +887,14 @@ public class SocketService
         catch (Exception e)
         {
             // Exception messages and raw JSON can contain sensitive data.
-            Logger.Error("WebSocket message processing failed", stage, e.GetType().Name);
+            if (!ShouldStop(cancellation))
+                Logger.Error("WebSocket message processing failed", stage, e.GetType().Name);
         }
     }
 
     private string ObtainSocketClientId(ClientWebSocket socket, string SocketToken, CancellationToken cancellation)
     {
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         if (socket.State != WebSocketState.Open)
             throw new Exception("Socket is closed");
 
@@ -867,7 +917,7 @@ public class SocketService
 
         WebSocketReceiveResult result;
         string authMessage = ReceiveSocketMessage(socket, cancellation, out result);
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         Logger.Debug("Auth response received");
         if (result.MessageType == WebSocketMessageType.Close)
         {
@@ -889,7 +939,7 @@ public class SocketService
     }
     private void SubscribeToTheChannel(ClientWebSocket socket, string Channel, string ChannelToken, CancellationToken cancellation)
     {
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         var request = new SubscribeRequest
         {
             Data = new SubscribeRequestData { Channel = Channel, Token = ChannelToken },
@@ -907,7 +957,7 @@ public class SocketService
         {
             WebSocketReceiveResult result;
             string jsonResponse = ReceiveSocketMessage(socket, cancellation, out result);
-            cancellation.ThrowIfCancellationRequested();
+            ThrowIfStopping(cancellation);
             Logger.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
@@ -961,7 +1011,7 @@ public class SocketService
         {
             response.EnsureSuccessStatusCode();
             string rawJson = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            cancellation.ThrowIfCancellationRequested();
+            ThrowIfStopping(cancellation);
             var result = JsonConvert.DeserializeObject<MediaSocketResponse>(CleanUpMediaResponseString(rawJson));
             if (result == null || string.IsNullOrEmpty(result.sid))
                 throw new InvalidDataException("Media response has no session identifier");
@@ -1027,13 +1077,15 @@ public class SocketService
 
         try
         {
-            Logger.Debug("Media Watcher started");
+            if (ShouldStop(run.Token))
+                return true;
+            LogLifecycle("Media Watcher started");
             RunMediaSocket(mediaToken, run.Token);
             return true;
         }
         catch (Exception e)
         {
-            if (run.IsCancellationRequested)
+            if (ShouldStop(run.Token))
                 return true;
             Logger.Error("Media Watcher failed", e.GetType().Name);
             return false;
@@ -1045,13 +1097,13 @@ public class SocketService
                 ActiveMediaRun = null;
                 run.Dispose();
             }
-            Logger.Debug("Media Watcher stopped");
+            LogLifecycle("Media Watcher stopped");
         }
     }
 
     private void SendMediaSocketPacket(ClientWebSocket socket, string packet, CancellationToken cancellation)
     {
-        cancellation.ThrowIfCancellationRequested();
+        ThrowIfStopping(cancellation);
         socket.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(packet)),
             WebSocketMessageType.Text, true, cancellation).GetAwaiter().GetResult();
     }
@@ -1074,10 +1126,10 @@ public class SocketService
                 catch (InvalidOperationException) { }
             }))
             {
-                cancellation.ThrowIfCancellationRequested();
+                ThrowIfStopping(cancellation);
                 Observer.Dispatch(EventStarted, null);
                 mediaSocket.ConnectAsync(new Uri(socketUrl), cancellation).GetAwaiter().GetResult();
-                cancellation.ThrowIfCancellationRequested();
+                ThrowIfStopping(cancellation);
                 if (mediaSocket.State != WebSocketState.Open)
                     throw new IOException("Media socket did not open");
 
@@ -1087,11 +1139,11 @@ public class SocketService
                 SendMediaSocketPacket(mediaSocket, "2", cancellation);
                 Logger.Debug("Media initialization flow is done");
 
-                while (!cancellation.IsCancellationRequested && mediaSocket.State == WebSocketState.Open)
+                while (!ShouldStop(cancellation) && mediaSocket.State == WebSocketState.Open)
                 {
                     WebSocketReceiveResult result;
                     string message = ReceiveSocketMessage(mediaSocket, cancellation, out result);
-                    cancellation.ThrowIfCancellationRequested();
+                    ThrowIfStopping(cancellation);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
                         Logger.Debug("Media socket connection is closed");
@@ -1107,10 +1159,10 @@ public class SocketService
                     if (result.MessageType == WebSocketMessageType.Text)
                         ProcessMediaMessage(message, cancellation);
 
-                    if (mediaSocket.State != WebSocketState.Open)
+                    if (ShouldStop(cancellation) || mediaSocket.State != WebSocketState.Open)
                         return;
                     SendMediaSocketPacket(mediaSocket, "2", cancellation);
-                    if (cancellation.WaitHandle.WaitOne(2000))
+                    if (cancellation.WaitHandle.WaitOne(2000) || ShouldStop(cancellation))
                         return;
                 }
             }
@@ -1121,7 +1173,7 @@ public class SocketService
     {
         try
         {
-            if (string.IsNullOrEmpty(message) || cancellation.IsCancellationRequested)
+            if (string.IsNullOrEmpty(message) || ShouldStop(cancellation))
                 return;
             string rawJson = CleanUpMediaResponseString(message);
             // Ignore Engine.IO probe/pong and Socket.IO control packets.
@@ -1141,7 +1193,7 @@ public class SocketService
                 return;
 
             var additionalData = JsonConvert.DeserializeObject<MediaAdditionalData>(mediaMessage.media.additional_data);
-            if (additionalData == null || cancellation.IsCancellationRequested)
+            if (additionalData == null || ShouldStop(cancellation))
                 return;
 
             Logger.Debug("Media request parsed");
@@ -1155,7 +1207,7 @@ public class SocketService
         }
         catch (Exception e)
         {
-            if (!cancellation.IsCancellationRequested)
+            if (!ShouldStop(cancellation))
                 Logger.Error("Media message processing failed", e.GetType().Name);
         }
     }
