@@ -86,10 +86,20 @@ public class CPHInline
         Service = new Service(new Client(), Logger);
 
         SocketService = new SocketService(Service, Logger);
+        ConfigureSocketHandlers();
     }
     public void Dispose()
     {
-        SocketService.Close();
+        // Do not wait for the action thread from the host's shutdown callback.
+        if (SocketService != null)
+            SocketService.Close();
+    }
+
+    public bool StopDonationCheckerLoop()
+    {
+        if (SocketService != null)
+            SocketService.Stop();
+        return true;
     }
     public bool CreateAuthLink()
     {
@@ -177,6 +187,12 @@ public class CPHInline
             throw new Exception("Unauthorized");
         }
 
+        return SocketService.Start(accessToken);
+    }
+
+    // Register once per compiled inline instance, not on every !da_start.
+    private void ConfigureSocketHandlers()
+    {
         SocketService
             .On(SocketService.EventStarted, delegate (string Event, Dictionary<string, string> Data)
             {
@@ -222,9 +238,6 @@ public class CPHInline
                 RunDonationActionIfExists(DefaultAfterDonationHandlerActionName, true);
             });
 
-
-        SocketService.Start(accessToken);
-        return true;
     }
     // Return whether the named action exists, not whether it ran successfully.
     // Do not fall back to a second action when an existing action reports failure.
@@ -306,8 +319,10 @@ public class SocketService
     public const string EventGoalUpdated      = "goal_updated";
     private EventObserver Observer { get; set; }
     private Service DaService { get; set; }
-    private ClientWebSocket Socket { get; set; }
     private CPHInline.PrefixedLogger Logger { get; set; }
+    private readonly object LifecycleLock = new object();
+    private CancellationTokenSource ActiveRun;
+    private bool IsDisposed;
 
     private const int BufferSize = 3072;
     private const int MaxSocketMessageSize = 4 * 1024 * 1024;
@@ -325,91 +340,183 @@ public class SocketService
         Observer.Subscribe(EventName, handler);
         return this;
     }
-    public Task Start(string AccessToken)
+    // Run in the invoking action's context: CPH.SetArgument and immediate
+    // RunAction depend on that context. Do not detach this into Task.Run.
+    public bool Start(string accessToken)
     {
-        return ConnectAndProccess(AccessToken);
+        CancellationTokenSource run;
+        lock (LifecycleLock)
+        {
+            if (IsDisposed)
+                return false;
+            if (ActiveRun != null)
+            {
+                Logger.Debug("Background Watcher is already running or stopping");
+                return true;
+            }
+
+            run = new CancellationTokenSource();
+            ActiveRun = run;
+        }
+
+        try
+        {
+            PreviousGoalEventHash = "";
+            Logger.Debug("Background Watcher started");
+            return RunConnections(accessToken, run.Token);
+        }
+        finally
+        {
+            lock (LifecycleLock)
+            {
+                ActiveRun = null;
+                run.Dispose();
+            }
+            Logger.Debug("Background Watcher stopped");
+        }
     }
+
+    // Manual stop permits a later start, but only after the old run exits.
+    public void Stop()
+    {
+        lock (LifecycleLock)
+        {
+            if (ActiveRun != null)
+                ActiveRun.Cancel();
+        }
+    }
+
+    // Permanent stop for this inline instance (Dispose/recompile/shutdown).
     public void Close()
     {
-        try
+        lock (LifecycleLock)
         {
-            if (Socket == null)
-                return;
-            Socket.Abort();
-            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-            Socket = null;
-            Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", "manual" } });
+            IsDisposed = true;
+            if (ActiveRun != null)
+                ActiveRun.Cancel();
         }
-        catch (Exception) { }
-
     }
-    private Task ConnectAndProccess(string AccessToken, bool isReconnected = false)
+
+    private bool RunConnections(string accessToken, CancellationToken cancellation)
     {
-        Service.ProfileInfoData userProfile = null;
-        try
+        bool isReconnected = false;
+        while (!cancellation.IsCancellationRequested)
         {
-            userProfile = DaService.GetProfileInfo(AccessToken);
-        } catch (WebException e)
-        {
-            var response = (HttpWebResponse)e.Response;
-            var statusCodeResponse = response.StatusCode;
-            if (statusCodeResponse == HttpStatusCode.Unauthorized)
+            bool receivedMessage = false;
+            try
             {
-                Observer.Dispatch(EventAuthError);
-                throw e;
+                RunConnection(accessToken, isReconnected, cancellation, ref receivedMessage);
             }
+            catch (WebException e)
+            {
+                if (cancellation.IsCancellationRequested)
+                    return true;
+
+                var response = e.Response as HttpWebResponse;
+                bool unauthorized = response != null && response.StatusCode == HttpStatusCode.Unauthorized;
+                if (e.Response != null)
+                    e.Response.Close();
+
+                if (unauthorized)
+                {
+                    Observer.Dispatch(EventAuthError);
+                    return false;
+                }
+
+                Logger.Error("WebSocket setup HTTP request failed", e.Status);
+            }
+            catch (Exception e)
+            {
+                // Cancellation can surface as OperationCanceledException,
+                // WebSocketException or ObjectDisposedException depending on the runtime.
+                if (cancellation.IsCancellationRequested)
+                    return true;
+
+                Logger.Error("WebSocket connection failed", e.GetType().Name);
+            }
+
+            if (cancellation.IsCancellationRequested)
+                return true;
+
+            if (isReconnected && !receivedMessage)
+            {
+                Logger.Error("Cannot reconnect to socket too many times");
+                return false;
+            }
+
+            isReconnected = true;
+            // Avoid a tight reconnect loop; wake immediately on stop.
+            if (cancellation.WaitHandle.WaitOne(1000))
+                return true;
         }
 
-        Socket = new ClientWebSocket();
-        Observer.Dispatch(EventStarted, null);
-        Socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
-        Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
+        return true;
+    }
 
-        if (Socket.State == WebSocketState.Open)
+    private void RunConnection(string accessToken, bool isReconnected,
+        CancellationToken cancellation, ref bool receivedMessage)
+    {
+        cancellation.ThrowIfCancellationRequested();
+        var userProfile = DaService.GetProfileInfo(accessToken, cancellation);
+        if (userProfile == null || string.IsNullOrEmpty(userProfile.SocketConnectionToken))
+            throw new InvalidDataException("Missing socket profile");
+
+        cancellation.ThrowIfCancellationRequested();
+        using (var socket = new ClientWebSocket())
+        using (cancellation.Register(() =>
         {
-            string socketClientId = ObtainSocketClientId(userProfile.SocketConnectionToken);
-            var channelInfoList = DaService.ObtainChannelSubscribeToken(AccessToken, userProfile.Id, socketClientId);
+            // Abort also unblocks a pending read on runtimes where cancellation
+            // alone is not sufficient. The connection owner disposes the socket.
+            try { socket.Abort(); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            Observer.Dispatch(EventStarted, null);
+            socket.ConnectAsync(new Uri(SocketHost), cancellation).GetAwaiter().GetResult();
+            cancellation.ThrowIfCancellationRequested();
+            Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
+
+            string socketClientId = ObtainSocketClientId(socket, userProfile.SocketConnectionToken, cancellation);
+            var channelInfoList = DaService.ObtainChannelSubscribeToken(accessToken, userProfile.Id, socketClientId, cancellation);
             foreach (var channelInfoItem in channelInfoList)
             {
-                this.SubscribeToTheChannel(channelInfoItem.Channel, channelInfoItem.Token);
+                cancellation.ThrowIfCancellationRequested();
+                SubscribeToTheChannel(socket, channelInfoItem.Channel, channelInfoItem.Token, cancellation);
             }
-        }
 
-        try
-        {
-            while (Socket.State == WebSocketState.Open)
+            while (!cancellation.IsCancellationRequested && socket.State == WebSocketState.Open)
             {
                 Logger.Debug("Waiting for a message");
                 WebSocketReceiveResult result;
-                string rawMessage = ReceiveSocketMessage(out result);
+                string rawMessage = ReceiveSocketMessage(socket, cancellation, out result);
+                cancellation.ThrowIfCancellationRequested();
+
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                     Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
+                    // Acknowledge the peer close, but never block shutdown on it.
+                    using (var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+                    {
+                        closeTimeout.CancelAfter(2000);
+                        socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, closeTimeout.Token).GetAwaiter().GetResult();
+                    }
+                    return;
                 }
-                else if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    isReconnected = false;
-                    ProcessSocketMessage(rawMessage);
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            Logger.Error("WebSocket receive loop failed", e.GetType().Name);
-            if (isReconnected)
-            {
-                Logger.Debug("Cannot reconnect to socket too many times");
-                return null;
-            }
-        }
 
-        return ConnectAndProccess(AccessToken, true);
+                if (result.MessageType == WebSocketMessageType.Text)
+                {
+                    receivedMessage = true;
+                    ProcessSocketMessage(rawMessage, cancellation);
+                }
+            }
+        }
     }
 
     // ReceiveAsync returns a chunk, not necessarily a complete message.
     // Decode UTF-8 only after assembling all chunks, including split multibyte characters.
-    private string ReceiveSocketMessage(out WebSocketReceiveResult result)
+    private string ReceiveSocketMessage(ClientWebSocket socket, CancellationToken cancellation, out WebSocketReceiveResult result)
     {
         var buffer = new ArraySegment<byte>(new byte[BufferSize]);
         using (var message = new MemoryStream())
@@ -417,7 +524,8 @@ public class SocketService
             int chunks = 0;
             do
             {
-                result = Socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
+                cancellation.ThrowIfCancellationRequested();
+                result = socket.ReceiveAsync(buffer, cancellation).GetAwaiter().GetResult();
                 if (result.MessageType == WebSocketMessageType.Close)
                     return null;
 
@@ -438,11 +546,13 @@ public class SocketService
         }
     }
 
-    private void ProcessSocketMessage(string rawMessage)
+    private void ProcessSocketMessage(string rawMessage, CancellationToken cancellation)
     {
         string stage = "raw event";
         try
         {
+            if (cancellation.IsCancellationRequested)
+                return;
             Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
 
             // Parse the envelope once. A malformed message must not disconnect the watcher.
@@ -483,6 +593,8 @@ public class SocketService
                     var donation = donationEvent.Data.Donation;
                     Logger.Debug("Donation publication parsed", "id=" + donation.Id);
                     stage = "donation dispatch";
+                    if (cancellation.IsCancellationRequested)
+                        return;
                     Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
                     Logger.Debug("Donation dispatch completed", "id=" + donation.Id);
                     break;
@@ -502,6 +614,8 @@ public class SocketService
                     }
 
                     stage = "goal dispatch";
+                    if (cancellation.IsCancellationRequested)
+                        return;
                     Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
                     PreviousGoalEventHash = goalHash;
                     break;
@@ -514,9 +628,10 @@ public class SocketService
         }
     }
 
-    private string ObtainSocketClientId(string SocketToken)
+    private string ObtainSocketClientId(ClientWebSocket socket, string SocketToken, CancellationToken cancellation)
     {
-        if (Socket == null || Socket.State != WebSocketState.Open)
+        cancellation.ThrowIfCancellationRequested();
+        if (socket.State != WebSocketState.Open)
             throw new Exception("Socket is closed");
 
 
@@ -529,21 +644,21 @@ public class SocketService
         };
         var payload = JsonConvert.SerializeObject(request);
 
-        Socket.SendAsync(
+        socket.SendAsync(
             new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
-            CancellationToken.None
+            cancellation
         ).GetAwaiter().GetResult();
 
         WebSocketReceiveResult result;
-        string authMessage = ReceiveSocketMessage(out result);
+        string authMessage = ReceiveSocketMessage(socket, cancellation, out result);
+        cancellation.ThrowIfCancellationRequested();
         Logger.Debug("Auth response received");
         if (result.MessageType == WebSocketMessageType.Close)
         {
-            Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
             Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
-            throw new Exception("Socket has closed connection");
+            throw new IOException("Socket closed during authentication");
         }
         Logger.Debug("Recieved auth message");
 
@@ -558,31 +673,32 @@ public class SocketService
 
         return authResponse.Data.Client;
     }
-    private void SubscribeToTheChannel(string Channel, string ChannelToken)
+    private void SubscribeToTheChannel(ClientWebSocket socket, string Channel, string ChannelToken, CancellationToken cancellation)
     {
+        cancellation.ThrowIfCancellationRequested();
         var request = new SubscribeRequest
         {
             Data = new SubscribeRequestData { Channel = Channel, Token = ChannelToken },
         };
         var payload = JsonConvert.SerializeObject(request);
-        Socket.SendAsync(
+        socket.SendAsync(
             new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
-            CancellationToken.None
+            cancellation
         ).GetAwaiter().GetResult();
         Logger.Debug("Subscribe request has been sent");
 
         for (int i = 0; i < 2; i++)
         {
             WebSocketReceiveResult result;
-            string jsonResponse = ReceiveSocketMessage(out result);
+            string jsonResponse = ReceiveSocketMessage(socket, cancellation, out result);
+            cancellation.ThrowIfCancellationRequested();
             Logger.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                 Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
-                throw new Exception("Socket has closed connection");
+                throw new IOException("Socket closed during subscription");
             }
             if (jsonResponse == null)
                 throw new InvalidDataException("Expected a text WebSocket subscribe response");
@@ -874,7 +990,7 @@ public class Service
         string url = Client.TargetHost + EndpointAuthorize;
         return string.Format("{0}?client_id={1}&redirect_uri={2}&scope={3}&response_type=code", url, ClientId, GetEncodedRedirectUri(), HttpUtility.UrlEncode(DefaultScope, Encoding.UTF8));
     }
-    public ProfileInfoData GetProfileInfo(string accessToken)
+    public ProfileInfoData GetProfileInfo(string accessToken, CancellationToken cancellation = default(CancellationToken))
     {
         var headers = new Dictionary<string, string>
         {
@@ -883,7 +999,7 @@ public class Service
 
         try
         {
-            string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers);
+            string json = Client.GET(EndpointProfileInfo, new Dictionary<string, string>(), headers, cancellation);
             ProfileInfoResponse profile = JsonConvert.DeserializeObject<ProfileInfoResponse>(json);
             Logger.Debug("Retrieved user profile info", profile.Data.Id);
 
@@ -891,8 +1007,9 @@ public class Service
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
-            throw e;
+            if (!cancellation.IsCancellationRequested)
+                Logger.WebError(e);
+            throw;
         }
     }
     public TokenResponse ObtainToken(string Code)
@@ -1037,7 +1154,8 @@ public class Service
         public string Error { get; set; }
     }
 
-    public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId)
+    public List<ChannelSubscribeResponse> ObtainChannelSubscribeToken(string AccessToken, int UserId, string SocketClientId,
+        CancellationToken cancellation = default(CancellationToken))
     {
         var request = new ChannelSubscribeRequest
         {
@@ -1056,7 +1174,7 @@ public class Service
 
         try
         {
-            var response = Client.POST(EndpointSubscribe, payload, headers);
+            var response = Client.POST(EndpointSubscribe, payload, headers, cancellation);
             var channels = JsonConvert.DeserializeObject<Dictionary<string, List<ChannelSubscribeResponse>>>(response);
             if (channels["channels"].Count == 0)
                 throw new Exception("Cannot fetch channels and it's tokens");
@@ -1065,8 +1183,9 @@ public class Service
         }
         catch (WebException e)
         {
-            Logger.WebError(e);
-            throw e;
+            if (!cancellation.IsCancellationRequested)
+                Logger.WebError(e);
+            throw;
         }
     }
 
@@ -1132,7 +1251,8 @@ public class Client
 {
     public const string TargetHost = "https://www.donationalerts.com";
 
-    public string GET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers)
+    public string GET(string endpoint, Dictionary<string, string> parameters, Dictionary<string, string> headers,
+        CancellationToken cancellation = default(CancellationToken))
     {
         var queryParams = new List<string>();
         foreach (var parameter in parameters)
@@ -1140,7 +1260,7 @@ public class Client
             queryParams.Add(string.Format("{0}={1}", parameter.Key, parameter.Value));
         }
         endpoint += "?" + String.Join("&", queryParams);
-        return this.Perform(WebRequestMethods.Http.Get, TargetHost + endpoint, new Dictionary<string, string>(), headers);
+        return this.Perform(WebRequestMethods.Http.Get, TargetHost + endpoint, string.Empty, headers, cancellation: cancellation);
     }
     public string GET(string endpoint, Dictionary<string, string> parameters)
     {
@@ -1150,9 +1270,10 @@ public class Client
     {
         return this.GET(endpoint, new Dictionary<string, string>());
     }
-    public string POST(string endpoint, string payload, Dictionary<string, string> headers)
+    public string POST(string endpoint, string payload, Dictionary<string, string> headers,
+        CancellationToken cancellation = default(CancellationToken))
     {
-        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers);
+        return this.Perform(WebRequestMethods.Http.Post, TargetHost + endpoint, payload, headers, cancellation: cancellation);
     }
     public string POST(string endpoint, Dictionary<string, string> payload, Dictionary<string, string> headers)
     {
@@ -1181,8 +1302,9 @@ public class Client
     }
 
     private string Perform(string method, string url, string payload, Dictionary<string, string> headers,
-        string contentType = "application/json")
+        string contentType = "application/json", CancellationToken cancellation = default(CancellationToken))
     {
+        cancellation.ThrowIfCancellationRequested();
         HttpWebRequest webRequest = (HttpWebRequest)WebRequest.Create(url);
         webRequest.Method = method;
         webRequest.ContentType = contentType;
@@ -1192,21 +1314,33 @@ public class Client
             webRequest.Headers.Set(header.Key, header.Value);
         }
 
-        if (payload != string.Empty)
+        // The watcher's cancellation also interrupts synchronous profile/subscription HTTP.
+        using (cancellation.Register(() =>
         {
-            byte[] requestBytes = Encoding.UTF8.GetBytes(payload);
-            webRequest.ContentLength = requestBytes.Length;
-            using (Stream requestStream = webRequest.GetRequestStream())
+            try { webRequest.Abort(); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            if (payload != string.Empty)
             {
-                requestStream.Write(requestBytes, 0, requestBytes.Length);
+                byte[] requestBytes = Encoding.UTF8.GetBytes(payload);
+                webRequest.ContentLength = requestBytes.Length;
+                using (Stream requestStream = webRequest.GetRequestStream())
+                {
+                    requestStream.Write(requestBytes, 0, requestBytes.Length);
+                }
             }
-        }
 
-        using (var response = (HttpWebResponse)webRequest.GetResponse())
-        using (Stream respStr = response.GetResponseStream())
-        using (StreamReader rdr = new StreamReader(respStr, Encoding.UTF8))
-        {
-            return rdr.ReadToEnd();
+            using (var response = (HttpWebResponse)webRequest.GetResponse())
+            using (Stream respStr = response.GetResponseStream())
+            using (StreamReader rdr = new StreamReader(respStr, Encoding.UTF8))
+            {
+                string body = rdr.ReadToEnd();
+                cancellation.ThrowIfCancellationRequested();
+                return body;
+            }
         }
     }
     private string Perform(string method, string url, Dictionary<string, string> payload, Dictionary<string, string> headers)
