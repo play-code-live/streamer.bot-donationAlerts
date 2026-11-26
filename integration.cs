@@ -5,6 +5,7 @@ using System.Web;
 using System.Threading.Tasks;
 using System.IO;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
 using System.Net.WebSockets;
 using System.Threading;
@@ -210,21 +211,40 @@ public class CPHInline
             })
             .On(SocketService.EventRecievedDonation, delegate (string Event, Dictionary<string, string> Data)
             {
+                Logger.Debug("Donation handler entered", "id=" + Data["id"]);
                 ExportDonation(Data);
-                string targetActionName = string.Format("DonationHandler_{0}", Data["amount"]);
-                if (CPH.ActionExists(targetActionName))
-                    CPH.RunAction(targetActionName, false);
-                else if (CPH.ActionExists(DefaultHandlerActionName))
-                    CPH.RunAction(DefaultHandlerActionName);
+                Logger.Debug("Donation arguments exported");
 
-                if (CPH.ActionExists(DefaultAfterDonationHandlerActionName))
-                    CPH.RunAction(DefaultAfterDonationHandlerActionName);
+                string targetActionName = string.Format("DonationHandler_{0}", Data["amount"]);
+                if (!RunDonationActionIfExists(targetActionName, false))
+                    RunDonationActionIfExists(DefaultHandlerActionName, true);
+
+                RunDonationActionIfExists(DefaultAfterDonationHandlerActionName, true);
             });
 
 
         SocketService.Start(accessToken);
         return true;
     }
+    // Return whether the named action exists, not whether it ran successfully.
+    // Do not fall back to a second action when an existing action reports failure.
+    private bool RunDonationActionIfExists(string actionName, bool runImmediately)
+    {
+        if (!CPH.ActionExists(actionName))
+        {
+            Logger.Debug("Donation action not found", actionName);
+            return false;
+        }
+
+        Logger.Debug("Running donation action", actionName, "immediate=" + runImmediately);
+        if (CPH.RunAction(actionName, runImmediately))
+            Logger.Debug("Donation action accepted", actionName);
+        else
+            Logger.Error("Donation action returned false", actionName);
+
+        return true;
+    }
+
     private void ExportDonation(Dictionary<string, string> Donation)
     {
         string username = "Anonymous";
@@ -290,6 +310,7 @@ public class SocketService
     private CPHInline.PrefixedLogger Logger { get; set; }
 
     private const int BufferSize = 3072;
+    private const int MaxSocketMessageSize = 4 * 1024 * 1024;
 
     private string PreviousGoalEventHash = "";
 
@@ -344,8 +365,6 @@ public class SocketService
         Socket.ConnectAsync(new Uri(SocketHost), CancellationToken.None).GetAwaiter().GetResult();
         Observer.Dispatch(isReconnected ? EventReconnected : EventConnected);
 
-        var buf = new ArraySegment<byte>(new byte[BufferSize]);
-
         if (Socket.State == WebSocketState.Open)
         {
             string socketClientId = ObtainSocketClientId(userProfile.SocketConnectionToken);
@@ -361,60 +380,23 @@ public class SocketService
             while (Socket.State == WebSocketState.Open)
             {
                 Logger.Debug("Waiting for a message");
-                var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+                WebSocketReceiveResult result;
+                string rawMessage = ReceiveSocketMessage(out result);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                     Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
                 }
-                else
+                else if (result.MessageType == WebSocketMessageType.Text)
                 {
                     isReconnected = false;
-                    Logger.Debug("Recieved message");
-                    string rawMessage = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-                    Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
-                    Logger.Debug(rawMessage);
-                    var socketMessage = JsonConvert.DeserializeObject<Dictionary<string, SocketMessage>>(rawMessage)["result"];
-                    try
-                    {
-                        var messageType = socketMessage.RecognizeType();
-                        switch (messageType)
-                        {
-                            case SocketMessage.TypeDonation:
-                                var donationEvent = JsonConvert.DeserializeObject<Dictionary<string, DonationResponse>>(rawMessage);
-                                if (!donationEvent["result"].IsValid())
-                                    continue;
-
-                                var donation = donationEvent["result"].Data.Donation;
-                                Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
-                                break;
-                            case SocketMessage.TypeGoal:
-                                var goalEvent = JsonConvert.DeserializeObject<Dictionary<string, GoalProgressResponse>>(rawMessage);
-                                if (!goalEvent["result"].IsValid())
-                                    continue;
-
-                                var goal = goalEvent["result"].Data.GoalData;
-                                var goalHash = Helper.GetMD5Hash(goal);
-
-                                if (goalHash == PreviousGoalEventHash)
-                                {
-                                    Logger.Debug("Duplicated goal data arrived. Skipping");
-                                    continue;
-                                }
-                                    
-                                PreviousGoalEventHash = goalHash;
-
-                                Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
-                                break;
-                        }
-                        
-                    }
-                    catch (Exception) { }
+                    ProcessSocketMessage(rawMessage);
                 }
             }
         }
-        catch (Exception)
+        catch (Exception e)
         {
+            Logger.Error("WebSocket receive loop failed", e.GetType().Name);
             if (isReconnected)
             {
                 Logger.Debug("Cannot reconnect to socket too many times");
@@ -423,6 +405,113 @@ public class SocketService
         }
 
         return ConnectAndProccess(AccessToken, true);
+    }
+
+    // ReceiveAsync returns a chunk, not necessarily a complete message.
+    // Decode UTF-8 only after assembling all chunks, including split multibyte characters.
+    private string ReceiveSocketMessage(out WebSocketReceiveResult result)
+    {
+        var buffer = new ArraySegment<byte>(new byte[BufferSize]);
+        using (var message = new MemoryStream())
+        {
+            int chunks = 0;
+            do
+            {
+                result = Socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return null;
+
+                chunks++;
+                if (message.Length + result.Count > MaxSocketMessageSize)
+                    throw new InvalidDataException("WebSocket message exceeds configured limit");
+
+                message.Write(buffer.Array, buffer.Offset, result.Count);
+            }
+            while (!result.EndOfMessage);
+
+            Logger.Debug("WebSocket message received", "bytes=" + message.Length,
+                "chunks=" + chunks, "type=" + result.MessageType);
+            if (result.MessageType != WebSocketMessageType.Text)
+                return null;
+
+            return Encoding.UTF8.GetString(message.ToArray());
+        }
+    }
+
+    private void ProcessSocketMessage(string rawMessage)
+    {
+        string stage = "raw event";
+        try
+        {
+            Observer.Dispatch(EventRecievedMessage, new Dictionary<string, string> { { "message", rawMessage } });
+
+            // Parse the envelope once. A malformed message must not disconnect the watcher.
+            stage = "JSON envelope";
+            var envelope = JObject.Parse(rawMessage);
+            var result = envelope["result"] as JObject;
+            if (result == null)
+            {
+                if (envelope["error"] != null)
+                    Logger.Error("WebSocket protocol error received");
+                return;
+            }
+
+            var socketMessage = result.ToObject<SocketMessage>();
+            var messageType = socketMessage.RecognizeType();
+            if (messageType == SocketMessage.TypeUnknown)
+                return;
+
+            // Join/leave confirmations have a channel but do not contain a publication.
+            var publication = result["data"] as JObject;
+            if (publication == null || !(publication["data"] is JObject))
+            {
+                Logger.Debug("WebSocket channel message has no publication", messageType);
+                return;
+            }
+
+            switch (messageType)
+            {
+                case SocketMessage.TypeDonation:
+                    stage = "donation deserialization";
+                    var donationEvent = result.ToObject<DonationResponse>();
+                    if (!donationEvent.IsValid())
+                    {
+                        Logger.Debug("Donation publication rejected: missing data or non-positive amount");
+                        return;
+                    }
+
+                    var donation = donationEvent.Data.Donation;
+                    Logger.Debug("Donation publication parsed", "id=" + donation.Id);
+                    stage = "donation dispatch";
+                    Observer.Dispatch(EventRecievedDonation, donation.ToDictionary());
+                    Logger.Debug("Donation dispatch completed", "id=" + donation.Id);
+                    break;
+
+                case SocketMessage.TypeGoal:
+                    stage = "goal deserialization";
+                    var goalEvent = result.ToObject<GoalProgressResponse>();
+                    if (!goalEvent.IsValid())
+                        return;
+
+                    var goal = goalEvent.Data.GoalData;
+                    var goalHash = Helper.GetMD5Hash(goal);
+                    if (goalHash == PreviousGoalEventHash)
+                    {
+                        Logger.Debug("Duplicated goal data arrived. Skipping");
+                        return;
+                    }
+
+                    stage = "goal dispatch";
+                    Observer.Dispatch(EventGoalUpdated, goal.ToDictionary());
+                    PreviousGoalEventHash = goalHash;
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            // Exception messages and raw JSON can contain sensitive data.
+            Logger.Error("WebSocket message processing failed", stage, e.GetType().Name);
+        }
     }
 
     private string ObtainSocketClientId(string SocketToken)
@@ -441,15 +530,15 @@ public class SocketService
         var payload = JsonConvert.SerializeObject(request);
 
         Socket.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
+            new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
             CancellationToken.None
         ).GetAwaiter().GetResult();
 
-        var buffer = new ArraySegment<byte>(new byte[BufferSize]);
-        var result = Socket.ReceiveAsync(buffer, CancellationToken.None).GetAwaiter().GetResult();
-        Logger.Debug("Auth response resieved");
+        WebSocketReceiveResult result;
+        string authMessage = ReceiveSocketMessage(out result);
+        Logger.Debug("Auth response received");
         if (result.MessageType == WebSocketMessageType.Close)
         {
             Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
@@ -458,7 +547,12 @@ public class SocketService
         }
         Logger.Debug("Recieved auth message");
 
-        var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(Encoding.ASCII.GetString(buffer.Array, 0, result.Count));
+        if (authMessage == null)
+            throw new InvalidDataException("Expected a text WebSocket auth response");
+
+        var authResponse = JsonConvert.DeserializeObject<SocketClientResponse>(authMessage);
+        if (authResponse == null || authResponse.Data == null || string.IsNullOrEmpty(authResponse.Data.Client))
+            throw new InvalidDataException("WebSocket auth response has no client identifier");
  
         Observer.Dispatch(EventAuthorized, new Dictionary<string, string> { { "client", authResponse.Data.Client }, { "version", authResponse.Data.Version } });
 
@@ -472,18 +566,17 @@ public class SocketService
         };
         var payload = JsonConvert.SerializeObject(request);
         Socket.SendAsync(
-            new ArraySegment<byte>(Encoding.ASCII.GetBytes(payload)),
+            new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload)),
             WebSocketMessageType.Text,
             true,
             CancellationToken.None
         ).GetAwaiter().GetResult();
         Logger.Debug("Subscribe request has been sent");
 
-        var buf = new ArraySegment<byte>(new byte[BufferSize]);
-
         for (int i = 0; i < 2; i++)
         {
-            var result = Socket.ReceiveAsync(buf, CancellationToken.None).GetAwaiter().GetResult();
+            WebSocketReceiveResult result;
+            string jsonResponse = ReceiveSocketMessage(out result);
             Logger.Debug("Subscribe response resieved");
             if (result.MessageType == WebSocketMessageType.Close)
             {
@@ -491,8 +584,9 @@ public class SocketService
                 Observer.Dispatch(EventDisconnected, new Dictionary<string, string> { { "description", result.CloseStatusDescription } });
                 throw new Exception("Socket has closed connection");
             }
-            var jsonResponse = Encoding.ASCII.GetString(buf.Array, 0, result.Count);
-            Logger.Debug("Subscribe response", jsonResponse);
+            if (jsonResponse == null)
+                throw new InvalidDataException("Expected a text WebSocket subscribe response");
+
             var response = JsonConvert.DeserializeObject<SubscribeResponse>(jsonResponse);
             if (response.Id != 0)
                 continue;
@@ -575,11 +669,11 @@ public class SocketService
         public string Channel { get; set; }
         public string RecognizeType()
         {
-            if (Channel.Contains("$alerts:donation"))
+            if (!string.IsNullOrEmpty(Channel) && Channel.StartsWith("$alerts:donation_", StringComparison.Ordinal))
             {
                 return TypeDonation;
             }
-            else if (Channel.Contains("$goals:goal"))
+            else if (!string.IsNullOrEmpty(Channel) && Channel.StartsWith("$goals:goal_", StringComparison.Ordinal))
             {
                 return TypeGoal;
             }
@@ -598,7 +692,7 @@ public class SocketService
 
         public bool IsValid()
         {
-            return Data.Donation.Amount > 0;
+            return Data != null && Data.Donation != null && Data.Donation.Amount > 0;
         }
     }
     private class DonationResponseData
@@ -650,7 +744,7 @@ public class SocketService
         public GoalProgressData Data = new GoalProgressData();
         public bool IsValid()
         {
-            return Data.GoalData.GoalAmount > 0;
+            return Data != null && Data.GoalData != null && Data.GoalData.GoalAmount > 0;
         }
     }
     private class GoalProgressData
